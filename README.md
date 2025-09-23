@@ -8,14 +8,14 @@ Equations and data generators evolve together and survive based on error thresho
 
 1. Clone and set up:
     ```
-    git clone https://github.com/USER/REPO.git
-    cd mc-symbolic-regression
+    git clone https://github.com/ammatsui/mcc-sr.git
+    cd mc-sr
     python3 -m venv .venv && source .venv/bin/activate
     pip install pytest numpy
     ```
 2. To run demo:
     ```
-    python -m mc_symbolic_regression.cli --data data/toy.csv
+    python -m mc_sr.cli --data data/toy.csv
     ```
 3. To run tests:
     ```
