@@ -22,5 +22,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install pytest numpy
+          pip install pytest scipy
+          pip install pytest openevolve
       - name: Run tests
         run: PYTHONPATH=src pytest
