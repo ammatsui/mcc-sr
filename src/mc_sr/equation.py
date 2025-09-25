@@ -4,6 +4,8 @@
 import numpy as np
 from scipy.optimize import least_squares
 
+operators = ['+', '-', '*', '/', 'sin', 'cos', 'pow']
+
 class EquationNode:
     """
     A node in the expression tree.
@@ -106,17 +108,72 @@ class Equation:
     def mutate(self):
         """
         Randomly mutate tree structure, operator, terminals or constants.
-        Useful for evolutionary search.
-        Randomly altering the syntax tree involves:
-
-Insert: Add a new random operator or sub-expression at a node.
-Delete: Remove a sub-tree or node.
-Substitute: Replace an operator, a terminal, or a constant.
-Perturb constants: Slightly change a numeric constant.
-
+        Actions:
+        - Insert: Add a new random operator or sub-expression at a node.
+        - Delete: Remove a sub-tree or node.
+        - Substitute: Replace an operator, a terminal, or a constant.
+        - Perturb constants: Slightly change a numeric constant.
         """
-        # Placeholder: implement mutation logic
-        raise NotImplementedError("Mutation not implemented")
+        import random
+        actions = ['insert', 'delete', 'substitute', 'perturb']
+        action = random.choice(actions)
+
+        def get_all_nodes(node, parent=None, nodes=None):
+            if nodes is None:
+                nodes = []
+            nodes.append((node, parent))
+            for child in node.children:
+                get_all_nodes(child, node, nodes)
+            return nodes
+
+        nodes = get_all_nodes(self.root)
+
+        if action == 'insert':
+            # Insert a random operator/subtree at a random node
+            op_choices = ['+', '-', '*', '/', 'sin', 'cos', 'pow']
+            op = random.choice(op_choices)
+            target, _ = random.choice(nodes)
+            # For binary ops, add two children; for unary, one
+            if op in ['sin', 'cos']:
+                new_child = EquationNode(random.choice(['x', 'const']))
+                new_node = EquationNode(op, [new_child])
+            elif op == 'pow':
+                left = EquationNode(random.choice(['x', 'const']))
+                right = EquationNode(random.choice(['x', 'const']))
+                new_node = EquationNode(op, [left, right])
+            else:
+                left = EquationNode(random.choice(['x', 'const']))
+                right = EquationNode(random.choice(['x', 'const']))
+                new_node = EquationNode(op, [left, right])
+            # Insert as a new child (or replace one child if possible)
+            target.children.append(new_node)
+
+        elif action == 'delete':
+            # Remove a random node (not root)
+            non_root_nodes = [(n, p) for n, p in nodes if p is not None]
+            if non_root_nodes:
+                node_to_delete, parent = random.choice(non_root_nodes)
+                parent.children = [c for c in parent.children if c != node_to_delete]
+
+        elif action == 'substitute':
+            # Replace a random node's value
+            node_to_sub, _ = random.choice(nodes)
+            if node_to_sub.value in ['+', '-', '*', '/', 'sin', 'cos', 'pow']:
+                op_choices = ['+', '-', '*', '/', 'sin', 'cos', 'pow']
+                node_to_sub.value = random.choice(op_choices)
+            elif node_to_sub.value == 'x':
+                node_to_sub.value = 'const'
+            elif node_to_sub.value == 'const':
+                node_to_sub.value = 'x'
+
+        elif action == 'perturb':
+            # Slightly change a random constant
+            if isinstance(self.constants, dict) and self.constants:
+                k = random.choice(list(self.constants.keys()))
+                self.constants[k] += np.random.normal(scale=0.1)
+            elif isinstance(self.constants, (list, np.ndarray)) and len(self.constants) > 0:
+                idx = random.randint(0, len(self.constants)-1)
+                self.constants[idx] += np.random.normal(scale=0.1)
     
     def to_prefix(self):
         """

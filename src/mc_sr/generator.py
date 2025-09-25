@@ -72,17 +72,60 @@ class Generator:
             raise ValueError("Improper configuration for generator")
         
     def mutate(self):
-        """Randomly mutate one parameter (range, noise, unit_scale, etc).
+        """
+        Randomly mutate one parameter (range, noise, unit_scale, etc).
         Mutation means altering data-creation parameters:
+        - Input range: Expand/narrow or shift sampling interval for x.
+        - Noise level: Increase or decrease σ (sigma) for added label noise.
+        - Distribution type: Switch between, e.g., uniform and normal.
+        - Sample size: Adjust n_g up/down.
+        - Unit/scaling: Modify scaling coefficient for x or y.
+        - Transform flags: Toggle augmentation options, e.g., enable/disable a specific data transform.
+        """
+        import random
+        mutation_types = ['input_range', 'noise', 'distribution', 'sample_size', 'unit_scale', 'transform_flag']
+        mutation = random.choice(mutation_types)
 
-Input range: Expand/narrow or shift sampling interval for x.
-Noise level: Increase or decrease σ (sigma) for added label noise.
-Distribution type: Switch between, e.g., uniform and normal.
-Sample size: Adjust n_g up/down.
-Unit/scaling: Modify scaling coefficient for x or y.
-Transform flags: Toggle augmentation options, e.g., enable/disable a specific data transform."""
-        # Placeholder logic
-        pass
+        if mutation == 'input_range':
+            # Expand, narrow, or shift interval
+            low, high = self.input_range
+            action = random.choice(['expand', 'narrow', 'shift'])
+            delta = (high - low) * 0.1
+            if action == 'expand':
+                self.input_range = (low - delta, high + delta)
+            elif action == 'narrow' and (high - low) > 2 * delta:
+                self.input_range = (low + delta, high - delta)
+            elif action == 'shift':
+                shift = random.uniform(-delta, delta)
+                self.input_range = (low + shift, high + shift)
+
+        elif mutation == 'noise':
+            # Increase or decrease sigma_y
+            factor = random.choice([0.8, 1.2])
+            self.sigma_y = max(1e-6, self.sigma_y * factor)
+
+        elif mutation == 'distribution':
+            # Switch between uniform and normal
+            self.px = 'normal' if self.px == 'uniform' else 'uniform'
+
+        elif mutation == 'sample_size':
+            # Adjust n_g up/down
+            change = random.choice([-32, 32])
+            self.n_g = max(1, self.n_g + change)
+
+        elif mutation == 'unit_scale':
+            # Modify scaling coefficient
+            factor = random.choice([0.9, 1.1])
+            self.unit_scale *= factor
+
+        elif mutation == 'transform_flag':
+            # Toggle a random transform flag
+            if self.transform_flags:
+                key = random.choice(list(self.transform_flags.keys()))
+                self.transform_flags[key] = not self.transform_flags[key]
+            else:
+                # Add a random flag if none exist
+                self.transform_flags['aug'] = True
 
     def to_vector(self):
         """Return generator parameters for clustering/species assignment."""
