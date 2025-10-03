@@ -1,6 +1,8 @@
 """Classes for evaluation metrics (minimal criterion) on equations and generators."""
 
 from abc import ABC, abstractmethod
+from equation import Equation
+from generator import Generator
 
 class MinimalCriterion(ABC):
     @abstractmethod
