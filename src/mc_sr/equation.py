@@ -3,8 +3,12 @@
 # import numpy for vectorized operations
 import numpy as np
 from scipy.optimize import least_squares
+import random
+import copy
 
 operators = ['+', '-', '*', '/', 'sin', 'cos', 'pow']
+binary_ops = ['+', '-', '*', '/', 'pow']
+unary_ops = ['sin', 'cos']
 
 class EquationNode:
     """
@@ -27,56 +31,107 @@ class Equation:
         self.root = root
         self.constants = constants if constants is not None else {}
 
+    @staticmethod
+    def random_init(max_depth=3,
+                    operators=None,
+                    p_const=0.5,
+                    n_constants_range=(1, 4)):
+        """
+        Randomly initialize an equation (tree structure and constants).
+        
+        Parameters:
+            max_depth: int, maximum tree depth.
+            operators: list of operators to choose from.
+            p_const: float, probability to generate a constant node.
+            n_constants_range: tuple, min/max constants in the expression.
+        Returns:
+            Equation instance.
+        """
+        operators = operators or ['+', '-', '*', '/', 'sin', 'cos', 'pow']
+        constants = {}
+        const_indices = []
+
+        def build_node(depth):
+            if depth >= max_depth or (depth>0 and random.random()<0.3):
+                # Terminal node
+                if random.random() < p_const:
+                    idx = len(const_indices)
+                    const_indices.append(idx)
+                    return EquationNode('const') #, const_idx=idx)
+                else:
+                    return EquationNode('x')
+            else:
+                op = random.choice(operators)
+                if op in ['sin', 'cos']:
+                    child = build_node(depth+1)
+                    return EquationNode(op, [child])
+                elif op == 'pow':
+                    left = build_node(depth+1)
+                    right = build_node(depth+1)
+                    return EquationNode(op, [left, right])
+                else:
+                    # binary
+                    left = build_node(depth+1)
+                    right = build_node(depth+1)
+                    return EquationNode(op, [left, right])
+
+        root = build_node(0)
+        # Initialize constants randomly, e.g. uniform [-2,2]
+        for idx in const_indices:
+            constants[idx] = np.random.uniform(-2,2)
+        eq = Equation(root, constants=constants)
+        print(eq)
+        return eq
+
     def evaluate(self, x):
+        """ToDo: add support for multiple variables"""
         """
         Evaluate the equation for given x values.
         x: float or np.ndarray
         Returns: float or np.ndarray
         """
-        # Simple parser for demonstration (supports +, -, *, /, sin, cos, power, x, constants)
-        stack = []
-        const_idx = 0
-        for token in self.tokens:
-            if token == 'x':
-                stack.append(x)
-            elif token.startswith('c') and token[1:].isdigit():
-                idx = int(token[1:])
-                stack.append(self.constants[idx])
-            elif token == '+':
-                b = stack.pop()
-                a = stack.pop()
-                stack.append(a + b)
-            elif token == '-':
-                b = stack.pop()
-                a = stack.pop()
-                stack.append(a - b)
-            elif token == '*':
-                b = stack.pop()
-                a = stack.pop()
-                stack.append(a * b)
-            elif token == '/':
-                b = stack.pop()
-                a = stack.pop()
-                stack.append(a / b)
-            elif token == 'sin':
-                a = stack.pop()
-                stack.append(np.sin(a))
-            elif token == 'cos':
-                a = stack.pop()
-                stack.append(np.cos(a))
-            elif token == 'power':
-                b = stack.pop()
-                a = stack.pop()
-                stack.append(np.power(a, b))
+        
+        def _eval(node, const_counter=[0]):
+            v = node.value
+            #print("Evaluating node:", v)
+            if v == 'x':
+                return x
+            elif v == 'const':
+                # Constants numbered by order of appearance during tree construction
+                idx = const_counter[0]
+                const_counter[0] += 1
+                #print("Using constant index:", idx, "value:", self.constants[idx])
+                return self.constants[idx]
+            elif v in {'+', '-', '*', '/', 'pow'}:
+                left = _eval(node.children[0], const_counter)
+                right = _eval(node.children[1], const_counter)
+                #print(f"Operator: {v}, Left: {left}, Right: {right}")
+                if v == '+': return left + right
+                if v == '-': return left - right
+                if v == '*': return left * right
+                if v == '/':
+                    # Avoid division by zero
+                    # Add small epsilon to denominator if needed
+                    return left / (right + 1e-8)
+                if v == 'pow':
+                    #print(f"Computing power: {left} ** {right}")
+                    return np.power(left, right)
+            elif v in {'sin', 'cos'}:
+                child = _eval(node.children[0], const_counter)
+                #print(f"Applying {v} to {child}")
+                if v == 'sin': return np.sin(child)
+                if v == 'cos': return np.cos(child)
             else:
-                raise ValueError(f"Unknown token: {token}")
-        if len(stack) != 1:
-            raise ValueError("Invalid equation structure")
-        return stack[0]
+                raise ValueError(f"Unknown node value: {v}")
+
+        # Always reset per call
+       
+        return _eval(self.root, [0])
     
     def calculate_mse(self, x_data, y_data):
         """Calculate MSE with current constants (no fitting)."""
         y_pred = self.evaluate(x_data)
+        #print(y_pred)
         mse = np.mean((y_pred - y_data)**2)
         return mse
     
@@ -87,15 +142,21 @@ class Equation:
         """
         def residual(c):
             # Predict y using candidate constants
-            y_pred = self.evaluate(x, constants=c)
-            return y_pred - y
+            y_pred = self.evaluate(x) #, constants=c)
+           # print("x:")
+           # print(x)
+            #print(self)
+            #print("evaluated y:")
+           # print (y_pred)
+            return (y_pred - y).flatten()
         
         # Initial guess: use current constants or 1s
         initial_c = np.array(
             [self.constants.get(i, 1.0) for i in range(len(self.constants))]
             ) if isinstance(self.constants, dict) else np.array(self.constants)
         if initial_c.size == 0:  # fallback if not set
-            initial_c = np.ones(2)
+            # """ToDo: tree size"""
+            initial_c = np.ones(10) 
         
         # Run non-linear least squares fit
         result = least_squares(residual, initial_c)
@@ -118,6 +179,8 @@ class Equation:
         actions = ['insert', 'delete', 'substitute', 'perturb']
         action = random.choice(actions)
 
+        mutant = copy.deepcopy(self)
+
         def get_all_nodes(node, parent=None, nodes=None):
             if nodes is None:
                 nodes = []
@@ -126,7 +189,7 @@ class Equation:
                 get_all_nodes(child, node, nodes)
             return nodes
 
-        nodes = get_all_nodes(self.root)
+        nodes = get_all_nodes(mutant.root)
 
         if action == 'insert':
             # Insert a random operator/subtree at a random node
@@ -137,30 +200,42 @@ class Equation:
             if op in ['sin', 'cos']:
                 new_child = EquationNode(random.choice(['x', 'const']))
                 new_node = EquationNode(op, [new_child])
-            elif op == 'pow':
-                left = EquationNode(random.choice(['x', 'const']))
-                right = EquationNode(random.choice(['x', 'const']))
-                new_node = EquationNode(op, [left, right])
+            # binary 
             else:
                 left = EquationNode(random.choice(['x', 'const']))
                 right = EquationNode(random.choice(['x', 'const']))
                 new_node = EquationNode(op, [left, right])
+                assert len(new_node.children) == 2
             # Insert as a new child (or replace one child if possible)
             target.children.append(new_node)
 
         elif action == 'delete':
             # Remove a random node (not root)
             non_root_nodes = [(n, p) for n, p in nodes if p is not None]
-            if non_root_nodes:
-                node_to_delete, parent = random.choice(non_root_nodes)
+            candidates = []
+            for n, p in non_root_nodes:
+                if p.value in binary_ops:
+                    # Deleting a child would leave <2 children: illegal, skip
+                    if len(p.children) <= 2:
+                        continue
+                if p.value in unary_ops:
+                    # Deleting a child would leave <1 child: illegal, skip
+                    if len(p.children) <= 1:
+                        continue
+                candidates.append((n, p))
+            if candidates:
+                node_to_delete, parent = random.choice(candidates)
                 parent.children = [c for c in parent.children if c != node_to_delete]
+           
 
         elif action == 'substitute':
             # Replace a random node's value
             node_to_sub, _ = random.choice(nodes)
-            if node_to_sub.value in ['+', '-', '*', '/', 'sin', 'cos', 'pow']:
-                op_choices = ['+', '-', '*', '/', 'sin', 'cos', 'pow']
-                node_to_sub.value = random.choice(op_choices)
+            # Change operator, variable, or constant
+            if node_to_sub.value in unary_ops:
+                node_to_sub.value = random.choice(unary_ops)
+            elif node_to_sub.value in binary_ops:
+                node_to_sub.value = random.choice(binary_ops)
             elif node_to_sub.value == 'x':
                 node_to_sub.value = 'const'
             elif node_to_sub.value == 'const':
@@ -168,12 +243,14 @@ class Equation:
 
         elif action == 'perturb':
             # Slightly change a random constant
-            if isinstance(self.constants, dict) and self.constants:
-                k = random.choice(list(self.constants.keys()))
-                self.constants[k] += np.random.normal(scale=0.1)
-            elif isinstance(self.constants, (list, np.ndarray)) and len(self.constants) > 0:
-                idx = random.randint(0, len(self.constants)-1)
-                self.constants[idx] += np.random.normal(scale=0.1)
+            if isinstance(mutant.constants, dict) and mutant.constants:
+                k = random.choice(list(mutant.constants.keys()))
+                mutant.constants[k] += np.random.normal(scale=0.1)
+            elif isinstance(mutant.constants, (list, np.ndarray)) and len(mutant.constants) > 0:
+                idx = random.randint(0, len(mutant.constants)-1)
+                mutant.constants[idx] += np.random.normal(scale=0.1)
+
+        return mutant
     
     def to_prefix(self):
         """
@@ -182,7 +259,7 @@ class Equation:
         # Placeholder: implement tree traversal here
         raise NotImplementedError("Prefix conversion not implemented")
     
-    def to_infix(self, node):
+    def _to_infix(self, node):
         """
         Recursively convert tree to infix notation string.
         Supports unary and binary operators.

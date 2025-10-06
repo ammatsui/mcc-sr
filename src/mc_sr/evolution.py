@@ -17,6 +17,9 @@ class EvolutionEngine:
     def __init__(self, equation_queue, generator_queue, anchor_x, anchor_y, 
                  tau, tau_prime, L_max,
                  n_generations=100, batch_size=10, logger=None):
+        for eq in equation_queue:
+            if eq is None:
+                raise RuntimeError("Equation queue returned None!")
         self.equation_queue = equation_queue
         self.generator_queue = generator_queue
         self.anchor_x = anchor_x
@@ -43,7 +46,7 @@ class EvolutionEngine:
         # If queue is smaller than batch_size, sample with replacement for infinite reproduction
         if len(queue) == 0:
             raise ValueError("Cannot select parents: queue is empty.")
-        return random.choices(queue, k=self.atch_size)
+        return random.choices(queue, k=self.batch_size)
     
     def trim_queue(self, queue):
         """Trim queue to max size by removing oldest entries."""
@@ -89,7 +92,7 @@ class EvolutionEngine:
                 # Refit constants (if structure mutated)
                 eq.fit_constants(self.anchor_x, self.anchor_y)
                 # MC gate: must pass on anchor AND at least one generator
-                if eq_mc.is_viable(eq, self.anchor_x, self.anchor_y, self.generator_queue):
+                if eq_mc.is_viable(eq, [self.anchor_x, self.anchor_y], self.generator_queue):
                     self.equation_queue.append(eq)
                     passed_eqs.append(eq)
                     self.trim_queue(self.equation_queue)

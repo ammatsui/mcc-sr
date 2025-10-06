@@ -2,9 +2,11 @@
 
 
 import numpy as np
+import random
+import copy
 
 class Generator:
-    def __init__(self, input_range=(-2, 2), px='uniform', n_g=512, sigma_y=0.02, unit_scale=1.0, transform_flags=None, anchor_data=None, mode="benchmark", f_star=None):
+    def __init__(self, anchor_data, input_range=(-2, 2), px='uniform', n_g=512, sigma_y=0.02, unit_scale=1.0, transform_flags=None, mode="benchmark", f_star=None):
         """
         Parameters
         ----------
@@ -27,6 +29,63 @@ class Generator:
         self.anchor_data = anchor_data
         self.mode = mode
         self.f_star = f_star
+
+
+    @staticmethod
+    def random_init(mode='benchmark',
+                    input_range_choices=[(-2, 2), (-5, 5), (0, 1), (-1, 3)],
+                    px_choices=['uniform', 'normal'],
+                    n_g_range=(256, 1024),
+                    sigma_y_range=(0.005, 0.05),
+                    unit_scale_range=(0.5, 2.0),
+                    transform_flag_pool=('aug', 'flip', 'scale'),
+                    anchor_data=None,
+                    f_star=None):
+        """
+        Returns a randomly initialized Generator instance.
+        
+        Parameters
+        ----------
+            mode: 'benchmark' or 'real'
+            input_range_choices: list of tuples for possible input ranges
+            px_choices: list of possible distribution names
+            n_g_range: tuple (min, max) for sample size
+            sigma_y_range: tuple (min, max) for output noise
+            unit_scale_range: tuple (min, max) for scaling
+            transform_flag_pool: tuple/list of possible transform flags
+            anchor_data: if mode=='real'
+            f_star: if mode=='benchmark'
+        """
+        
+        input_range = random.choice(input_range_choices)
+        px = random.choice(px_choices)
+        n_g = random.randint(n_g_range[0], n_g_range[1])
+        sigma_y = np.random.uniform(*sigma_y_range)
+        unit_scale = np.random.uniform(*unit_scale_range)
+        
+        # Random transform flags: each with random True/False
+        transform_flags = {k: bool(random.getrandbits(1)) for k in transform_flag_pool}
+        
+        # If benchmark, need a function f_star
+        if mode == 'benchmark' and f_star is None:
+            # Example: f(x) = sin(x) + x^2
+            f_star = lambda x: np.sin(x) + x**2
+        
+        # If real, need anchor_data (or leave as None)
+        # anchor_data should be provided externally if wanted
+
+        gen = Generator(
+            input_range=input_range,
+            px=px,
+            n_g=n_g,
+            sigma_y=sigma_y,
+            unit_scale=unit_scale,
+            transform_flags=transform_flags,
+            anchor_data=anchor_data,
+            mode=mode,
+            f_star=f_star
+        )
+        return gen
 
     def sample(self):
         """
@@ -86,46 +145,50 @@ class Generator:
         mutation_types = ['input_range', 'noise', 'distribution', 'sample_size', 'unit_scale', 'transform_flag']
         mutation = random.choice(mutation_types)
 
+        mutant = copy.deepcopy(self)
+
         if mutation == 'input_range':
             # Expand, narrow, or shift interval
             low, high = self.input_range
             action = random.choice(['expand', 'narrow', 'shift'])
             delta = (high - low) * 0.1
             if action == 'expand':
-                self.input_range = (low - delta, high + delta)
+                mutant.input_range = (low - delta, high + delta)
             elif action == 'narrow' and (high - low) > 2 * delta:
-                self.input_range = (low + delta, high - delta)
+                mutant.input_range = (low + delta, high - delta)
             elif action == 'shift':
                 shift = random.uniform(-delta, delta)
-                self.input_range = (low + shift, high + shift)
+                mutant.input_range = (low + shift, high + shift)
 
         elif mutation == 'noise':
             # Increase or decrease sigma_y
             factor = random.choice([0.8, 1.2])
-            self.sigma_y = max(1e-6, self.sigma_y * factor)
+            mutant.sigma_y = max(1e-6, self.sigma_y * factor)
 
         elif mutation == 'distribution':
             # Switch between uniform and normal
-            self.px = 'normal' if self.px == 'uniform' else 'uniform'
+            mutant.px = 'normal' if self.px == 'uniform' else 'uniform'
 
         elif mutation == 'sample_size':
             # Adjust n_g up/down
             change = random.choice([-32, 32])
-            self.n_g = max(1, self.n_g + change)
+            mutant.n_g = max(1, self.n_g + change)
 
         elif mutation == 'unit_scale':
             # Modify scaling coefficient
             factor = random.choice([0.9, 1.1])
-            self.unit_scale *= factor
+            mutant.unit_scale *= factor
 
         elif mutation == 'transform_flag':
             # Toggle a random transform flag
             if self.transform_flags:
                 key = random.choice(list(self.transform_flags.keys()))
-                self.transform_flags[key] = not self.transform_flags[key]
+                mutant.transform_flags[key] = not self.transform_flags[key]
             else:
                 # Add a random flag if none exist
-                self.transform_flags['aug'] = True
+                mutant.transform_flags['aug'] = True
+
+        return mutant
 
     def to_vector(self):
         """Return generator parameters for clustering/species assignment."""
