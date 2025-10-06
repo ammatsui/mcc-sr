@@ -104,19 +104,19 @@ if __name__ == "__main__":
         logger=logger
     )
 
-    eqs, gens, metrics = engine.run()
+    eqs, gens = engine.run()
     
-    # --- Save results to files ---
-    with open("results_equations.txt", "w") as f_eq:
-        for eq in eqs:
-            f_eq.write(str(eq) + "\n")
+    # # --- Save results to files ---
+    # with open("results_equations.txt", "w") as f_eq:
+    #     for eq in eqs:
+    #         f_eq.write(str(eq) + "\n")
             
-    with open("results_generators.txt", "w") as f_gen:
-        for gen in gens:
-            f_gen.write(str(gen) + "\n")
+    # with open("results_generators.txt", "w") as f_gen:
+    #     for gen in gens:
+    #         f_gen.write(str(gen) + "\n")
     
-    with open("results_metrics.json", "w") as f_metrics:
-        json.dump(metrics, f_metrics, indent=2)
+    # with open("results_metrics.json", "w") as f_metrics:
+    #     json.dump(metrics, f_metrics, indent=2)
 
     print("Results saved to results_equations.txt, results_generators.txt, and results_metrics.json")
 

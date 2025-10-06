@@ -132,4 +132,4 @@ class EvolutionEngine:
             # ===== 9. END Generation =====
 
         # ===== 10. FINALIZE =====
-        return self.equation_queue, self.generator_queue, self.logger.metrics
+        return self.equation_queue, self.generator_queue #, self.logger.metrics

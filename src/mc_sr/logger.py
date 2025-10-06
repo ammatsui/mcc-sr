@@ -1,5 +1,5 @@
 class MetricLogger:
-    def __init__(self, log_file=None):
+    def __init__(self, log_file=True):
         self.records = []
         self.log_file = log_file
 
@@ -19,7 +19,7 @@ class MetricLogger:
         if self.log_file:
             # Optionally write to file/CSV immediately
             import json
-            with open(self.log_file, 'a') as f:
+            with open(self.log_file, "w") as f:
                 f.write(json.dumps(log_entry) + '\n')
 
     def to_dataframe(self):

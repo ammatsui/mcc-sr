@@ -112,10 +112,16 @@ class Equation:
                 if v == '/':
                     # Avoid division by zero
                     # Add small epsilon to denominator if needed
-                    return left / (right + 1e-8)
+                    # Robust division with per-element epsilon
+                    right_safe = np.where(np.abs(right) < 1e-8, 1e-8, right)
+                    return left / right_safe
                 if v == 'pow':
-                    #print(f"Computing power: {left} ** {right}")
-                    return np.power(left, right)
+                    # Avoid complex results for negative bases and non-integer exponents
+                    with np.errstate(invalid="ignore"):
+                        result = np.power(left, right)
+                        # fallback: replace nan/inf with large value
+                        result = np.where(np.isfinite(result), result, 1e6)
+                    return result
             elif v in {'sin', 'cos'}:
                 child = _eval(node.children[0], const_counter)
                 #print(f"Applying {v} to {child}")
@@ -135,6 +141,8 @@ class Equation:
         mse = np.mean((y_pred - y_data)**2)
         return mse
     
+    
+
     def fit_constants(self, x, y, method="lsq"):
         """
         Fit or optimize the constants of the equation so that self.evaluate(x_data) matches y_data (min MSE).
@@ -143,20 +151,25 @@ class Equation:
         def residual(c):
             # Predict y using candidate constants
             y_pred = self.evaluate(x) #, constants=c)
-           # print("x:")
-           # print(x)
-            #print(self)
-            #print("evaluated y:")
-           # print (y_pred)
-            return (y_pred - y).flatten()
+            res = (y_pred - y).flatten()
+            # Mask nans/infs for optimizer
+            res = np.where(np.isfinite(res), res, 1e6)
+            return res
+        
+        def count_param_nodes(node):
+            count = 1  # Each node has a constant
+            for child in node.children:
+                count += count_param_nodes(child)
+            return count
         
         # Initial guess: use current constants or 1s
         initial_c = np.array(
             [self.constants.get(i, 1.0) for i in range(len(self.constants))]
             ) if isinstance(self.constants, dict) else np.array(self.constants)
         if initial_c.size == 0:  # fallback if not set
-            # """ToDo: tree size"""
-            initial_c = np.ones(10) 
+            # number of constants = number of nodes in the tree
+            num_consts = count_param_nodes(self.root)
+            initial_c = np.ones(num_consts)
         
         # Run non-linear least squares fit
         result = least_squares(residual, initial_c)
