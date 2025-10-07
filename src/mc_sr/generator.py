@@ -111,7 +111,8 @@ class Generator:
             y = self.f_star(x) + np.random.normal(0, self.sigma_y, self.n_g)
             # 4. Any additional transforms
             # (can implement more via transform_flags)
-            return x, y
+           
+            return x.reshape(-1, 1), y
 
         elif self.mode == "real" and self.anchor_data is not None:
             X_anchor, y_anchor = self.anchor_data

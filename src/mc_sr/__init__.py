@@ -19,8 +19,8 @@ def load_dataset(path):
 # if __name__ == "__main__":
 #     D0 = load_dataset('./dataset/I.6.2.txt') # user supplies filename
 #     print("Anchor dataset loaded.")
-
-#     equation = Equation.random_init()
+#     print("X shape:", D0[0].shape)
+#     equation = Equation.random_init(D0[0].shape[1])
 #     print("Random equation initialized:")
 #     print(equation)
 
@@ -66,7 +66,7 @@ if __name__ == "__main__":
 
     # Initial seeds (example)
     # --- Create queues ---
-    equation_queue = [Equation.random_init() for _ in range(5)]
+    equation_queue = [Equation.random_init(D0[0].shape[1]) for _ in range(5)]
    # gen = Generator(anchor_data = D0)
     generator_queue = [Generator.random_init(anchor_data = D0) for _ in range(5)]
 
@@ -118,7 +118,7 @@ if __name__ == "__main__":
     # with open("results_metrics.json", "w") as f_metrics:
     #     json.dump(metrics, f_metrics, indent=2)
 
-    print("Results saved to results_equations.txt, results_generators.txt, and results_metrics.json")
+    # print("Results saved to results_equations.txt, results_generators.txt, and results_metrics.json")
 
 
 print("Done.")

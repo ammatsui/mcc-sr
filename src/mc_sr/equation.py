@@ -23,16 +23,17 @@ class Equation:
     """
     Represents a symbolic equation as an expression tree with tunable constants.
     """
-    def __init__(self, root, constants=None):
+    def __init__(self, root, n_variables = 1, constants=None):
         """
         root: EquationNode, the root of the tree.
         constants: dict mapping names or indices to values (could be a list, array, or dict).
         """
         self.root = root
+        self.n_variables = n_variables # number of input variables
         self.constants = constants if constants is not None else {}
 
     @staticmethod
-    def random_init(max_depth=3,
+    def random_init(n_vars, max_depth=3,
                     operators=None,
                     p_const=0.5,
                     n_constants_range=(1, 4)):
@@ -50,6 +51,8 @@ class Equation:
         operators = operators or ['+', '-', '*', '/', 'sin', 'cos', 'pow']
         constants = {}
         const_indices = []
+        var_nodes = [f'x{i}' for i in range(n_vars)]
+        # print("Variable nodes:", var_nodes)
 
         def build_node(depth):
             if depth >= max_depth or (depth>0 and random.random()<0.3):
@@ -59,7 +62,8 @@ class Equation:
                     const_indices.append(idx)
                     return EquationNode('const') #, const_idx=idx)
                 else:
-                    return EquationNode('x')
+                    var = random.choice(var_nodes)
+                    return EquationNode(var)
             else:
                 op = random.choice(operators)
                 if op in ['sin', 'cos']:
@@ -79,8 +83,10 @@ class Equation:
         # Initialize constants randomly, e.g. uniform [-2,2]
         for idx in const_indices:
             constants[idx] = np.random.uniform(-2,2)
-        eq = Equation(root, constants=constants)
-        print(eq)
+        eq = Equation(root, n_variables=n_vars, constants=constants)
+        # print(eq)
+        assert eq.n_variables == n_vars
+        assert eq is not None
         return eq
 
     def evaluate(self, x):
@@ -90,18 +96,22 @@ class Equation:
         x: float or np.ndarray
         Returns: float or np.ndarray
         """
-        
+        # print("Data shape:", x.shape)
+        # print("Data:", x)
+        assert x.ndim == 2 and x.shape[1] == self.n_variables
+
         def _eval(node, const_counter=[0]):
             v = node.value
             #print("Evaluating node:", v)
-            if v == 'x':
-                return x
-            elif v == 'const':
+            if v == 'const':
                 # Constants numbered by order of appearance during tree construction
                 idx = const_counter[0]
                 const_counter[0] += 1
                 #print("Using constant index:", idx, "value:", self.constants[idx])
                 return self.constants[idx]
+            elif v.startswith('x'):
+                vi = int(v[1:])
+                return x[:, vi]
             elif v in {'+', '-', '*', '/', 'pow'}:
                 left = _eval(node.children[0], const_counter)
                 right = _eval(node.children[1], const_counter)
