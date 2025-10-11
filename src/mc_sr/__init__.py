@@ -17,12 +17,20 @@ def load_dataset(path):
     return X, y
 
 # if __name__ == "__main__":
-#     D0 = load_dataset('./dataset/I.6.2.txt') # user supplies filename
+#     D0= load_dataset('./dataset/I.6.2.txt') # user supplies filename
 #     print("Anchor dataset loaded.")
 #     print("X shape:", D0[0].shape)
 #     equation = Equation.random_init(D0[0].shape[1])
 #     print("Random equation initialized:")
 #     print(equation)
+
+# print("Before fitting:", equation)
+# mse_before = equation.calculate_mse(D0[0], D0[1])
+# print("MSE before:", mse_before)
+
+# mse_after = equation.fit_constants(D0[0], D0[1])
+# print("After fitting:", equation)
+# print("MSE after:", mse_after)
 
 #     y = equation.evaluate(D0[0])
 #     print("Equation evaluated on anchor data.")

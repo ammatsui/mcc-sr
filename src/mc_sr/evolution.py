@@ -120,8 +120,13 @@ class EvolutionEngine:
                 gen_passed=len(passed_gens),
                 eq_queue_size=len(self.equation_queue),
                 gen_queue_size=len(self.generator_queue)
+                # eqs = self.equation_queue,
+                # gens = self.generator_queue
             )
-
+            print(f"Gen {generation}: {len(passed_eqs)} equations and {len(passed_gens)} generators passed MC.")
+            print(f"  Queue sizes - Equations: {len(self.equation_queue)}, Generators: {len(self.generator_queue)}")
+            print(f"Equations: {[str(eq) for eq in self.equation_queue]}")
+            print(f"Generators: {[str(gen) for gen in self.generator_queue]}")
             # ===== 8. OPTIONAL: LLM TRIGGERS, COVERAGE GRID =====
             if self.llm_enabled and self.check_stagnation():
                 self.llm_mutate_generation()

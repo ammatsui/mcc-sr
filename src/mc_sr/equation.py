@@ -15,9 +15,14 @@ class EquationNode:
     A node in the expression tree.
     Each node can be an operator (like '+', '*', 'sin') or a terminal (like 'x' or a constant).
     """
-    def __init__(self, value, children=None):
+    def __init__(self, value, const_idx=None, children=None):
         self.value = value  # operator, variable, or constant
+        self.const_idx = const_idx
         self.children = children or []  # list of child nodes
+        if self.value in binary_ops:
+            assert len(self.children) == 2, f"Binary operator {self.value} must have 2 children."
+        elif self.value in unary_ops:
+            assert len(self.children) == 1, f"Unary operator {self.value} must have 1 child."
 
 class Equation:
     """
@@ -60,7 +65,7 @@ class Equation:
                 if random.random() < p_const:
                     idx = len(const_indices)
                     const_indices.append(idx)
-                    return EquationNode('const') #, const_idx=idx)
+                    return EquationNode('const', const_idx=idx)
                 else:
                     var = random.choice(var_nodes)
                     return EquationNode(var)
@@ -68,16 +73,16 @@ class Equation:
                 op = random.choice(operators)
                 if op in ['sin', 'cos']:
                     child = build_node(depth+1)
-                    return EquationNode(op, [child])
+                    return EquationNode(op, children = [child])
                 elif op == 'pow':
                     left = build_node(depth+1)
                     right = build_node(depth+1)
-                    return EquationNode(op, [left, right])
+                    return EquationNode(op, children = [left, right])
                 else:
                     # binary
                     left = build_node(depth+1)
                     right = build_node(depth+1)
-                    return EquationNode(op, [left, right])
+                    return EquationNode(op, children = [left, right])
 
         root = build_node(0)
         # Initialize constants randomly, e.g. uniform [-2,2]
@@ -105,7 +110,8 @@ class Equation:
             #print("Evaluating node:", v)
             if v == 'const':
                 # Constants numbered by order of appearance during tree construction
-                idx = const_counter[0]
+                # the value is stored in the node
+                idx = node.const_idx
                 const_counter[0] += 1
                 #print("Using constant index:", idx, "value:", self.constants[idx])
                 return self.constants[idx]
@@ -151,7 +157,6 @@ class Equation:
         mse = np.mean((y_pred - y_data)**2)
         return mse
     
-    
 
     def fit_constants(self, x, y, method="lsq"):
         """
@@ -160,6 +165,7 @@ class Equation:
         """
         def residual(c):
             # Predict y using candidate constants
+            self.constants = c
             y_pred = self.evaluate(x) #, constants=c)
             res = (y_pred - y).flatten()
             # Mask nans/infs for optimizer
@@ -222,12 +228,12 @@ class Equation:
             # For binary ops, add two children; for unary, one
             if op in ['sin', 'cos']:
                 new_child = EquationNode(random.choice(['x', 'const']))
-                new_node = EquationNode(op, [new_child])
+                new_node = EquationNode(op, children = [new_child])
             # binary 
             else:
                 left = EquationNode(random.choice(['x', 'const']))
                 right = EquationNode(random.choice(['x', 'const']))
-                new_node = EquationNode(op, [left, right])
+                new_node = EquationNode(op, children = [left, right])
                 assert len(new_node.children) == 2
             # Insert as a new child (or replace one child if possible)
             target.children.append(new_node)
@@ -291,7 +297,7 @@ class Equation:
         if not node.children:
             if node.value == "const":
                 # Assume constants are indexed by order
-                idx = getattr(node, "const_idx", 0)
+                idx = node.const_idx
                 return str(self.constants[idx])
             return str(node.value)
         
