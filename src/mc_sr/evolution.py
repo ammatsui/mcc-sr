@@ -12,11 +12,15 @@ from generator import Generator
 from mcc import EquationMC, GeneratorMC
 from logger import MetricLogger
 import random, numpy
+from llm_integration import LLMMutator
+
+                # Initialize LLM Mutator
+                
 
 class EvolutionEngine:
     def __init__(self, equation_queue, generator_queue, anchor_x, anchor_y, 
                  tau, tau_prime, L_max,
-                 n_generations=100, batch_size=10, logger=None):
+                 n_generations=100, batch_size=10, logger=None, llm_enabled=False):
         for eq in equation_queue:
             if eq is None:
                 raise RuntimeError("Equation queue returned None!")
@@ -34,7 +38,12 @@ class EvolutionEngine:
         self.coverage_grid_history = []        # Cells filled per gen (optional)
         self.stagnation_window = 30            # How many generations to look back
         self.stagnation_min_passes = 0         # Min passes to avoid stagnation
-        self.llm_enabled = False               # Toggle for LLM mutation
+        self.llm_enabled = llm_enabled         # Toggle for LLM mutation
+        if self.llm_enabled:
+            self.llm = LLMMutator()             # Initialize LLM mutator
+            print("LLM integration enabled.")
+        else:
+            self.llm = None
         # add any other state you want to track (species, metrics, etc.)
 
     # def log_generation_metrics(self, passed_eqs, passed_gens):
@@ -119,17 +128,40 @@ class EvolutionEngine:
                 eq_passed=len(passed_eqs),
                 gen_passed=len(passed_gens),
                 eq_queue_size=len(self.equation_queue),
-                gen_queue_size=len(self.generator_queue)
-                # eqs = self.equation_queue,
-                # gens = self.generator_queue
+                gen_queue_size=len(self.generator_queue),
+                equation_population = self.equation_queue,
+                generators_population = self.generator_queue
             )
-            print(f"Gen {generation}: {len(passed_eqs)} equations and {len(passed_gens)} generators passed MC.")
-            print(f"  Queue sizes - Equations: {len(self.equation_queue)}, Generators: {len(self.generator_queue)}")
-            print(f"Equations: {[str(eq) for eq in self.equation_queue]}")
-            print(f"Generators: {[str(gen) for gen in self.generator_queue]}")
+            # print(f"Gen {generation}: {len(passed_eqs)} equations and {len(passed_gens)} generators passed MC.")
+            # print(f"  Queue sizes - Equations: {len(self.equation_queue)}, Generators: {len(self.generator_queue)}")
+            # print(f"Equations: {[str(eq) for eq in self.equation_queue]}")
+            # print(f"Generators: {[str(gen) for gen in self.generator_queue]}")
             # ===== 8. OPTIONAL: LLM TRIGGERS, COVERAGE GRID =====
             if self.llm_enabled and self.check_stagnation():
-                self.llm_mutate_generation()
+                print("Stagnation detected. Triggering LLM mutation...")
+                eq_to_mutate = random.choice(eq_children)
+                # Export your equation as string (or other format)
+                eq_str = str(eq_to_mutate)
+
+                # Get LLM-suggested mutation
+                with open(self.logger.log_file, "r") as f:
+                    data = f.read()
+
+                mutation = self.llm.propose_eq_mutation(eq_str, context=data)
+                if mutation:
+                    # Apply mutation to create new equation
+                    new_eq = self.llm.apply_eq_mutation(eq_to_mutate, mutation)
+                    if new_eq:
+                        self.equation_queue.append(new_eq)
+                        self.trim_queue(self.equation_queue)
+                        # print(f"LLM mutation applied: {mutation}")
+                else:
+                    print("LLM did not propose a valid mutation.")
+               
+                
+                # gen_to_mutate = random.choice(gen_children)
+                # gen_to_mutate = gen_to_mutate.mutate()
+                # self.generator_queue.append(gen_to_mutate)
         
             # if self.use_map_elites:
             #     self.update_coverage_grid(passed_eqs, passed_gens)

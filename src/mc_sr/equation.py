@@ -194,8 +194,16 @@ class Equation:
         # Compute and return MSE
         mse = np.mean(residual(result.x)**2)
         return mse
+    
+    def random_terminal(self):
+        if random.random() < 0.5:
+            return EquationNode('const')
+        else:
+            var_idx = random.randint(0, self.n_variables - 1)
+            return EquationNode(f'x{var_idx}')
 
-    def mutate(self):
+
+    def mutate(self, action=None, node=None, value=None):
         """
         Randomly mutate tree structure, operator, terminals or constants.
         Actions:
@@ -206,7 +214,10 @@ class Equation:
         """
         import random
         actions = ['insert', 'delete', 'substitute', 'perturb']
-        action = random.choice(actions)
+        if action is None:
+            action = random.choice(actions)
+
+        terminals = ['const'] + [f'x{i}' for i in range(self.n_variables)]
 
         mutant = copy.deepcopy(self)
 
@@ -222,17 +233,24 @@ class Equation:
 
         if action == 'insert':
             # Insert a random operator/subtree at a random node
-            op_choices = ['+', '-', '*', '/', 'sin', 'cos', 'pow']
-            op = random.choice(op_choices)
-            target, _ = random.choice(nodes)
+            if value is None:
+                op_choices = ['+', '-', '*', '/', 'sin', 'cos', 'pow']
+                op = random.choice(op_choices)
+            else:
+                op = value
+            # Choose a random target node to insert at
+            if node is None:
+                target, _ = random.choice(nodes)
+            else:
+                target = node
             # For binary ops, add two children; for unary, one
             if op in ['sin', 'cos']:
-                new_child = EquationNode(random.choice(['x', 'const']))
+                new_child = self.random_terminal()
                 new_node = EquationNode(op, children = [new_child])
             # binary 
             else:
-                left = EquationNode(random.choice(['x', 'const']))
-                right = EquationNode(random.choice(['x', 'const']))
+                left = self.random_terminal()
+                right = self.random_terminal()
                 new_node = EquationNode(op, children = [left, right])
                 assert len(new_node.children) == 2
             # Insert as a new child (or replace one child if possible)
@@ -240,6 +258,7 @@ class Equation:
 
         elif action == 'delete':
             # Remove a random node (not root)
+            
             non_root_nodes = [(n, p) for n, p in nodes if p is not None]
             candidates = []
             for n, p in non_root_nodes:
@@ -253,22 +272,36 @@ class Equation:
                         continue
                 candidates.append((n, p))
             if candidates:
-                node_to_delete, parent = random.choice(candidates)
+                if node is None:
+                    node_to_delete, parent = random.choice(candidates)
+                else:
+                    node_to_delete = node
+                    parent = next((p for n, p in candidates if n == node), None)
                 parent.children = [c for c in parent.children if c != node_to_delete]
            
 
         elif action == 'substitute':
             # Replace a random node's value
-            node_to_sub, _ = random.choice(nodes)
+            if node is None:
+                node_to_sub, _ = random.choice(nodes)
             # Change operator, variable, or constant
             if node_to_sub.value in unary_ops:
                 node_to_sub.value = random.choice(unary_ops)
             elif node_to_sub.value in binary_ops:
                 node_to_sub.value = random.choice(binary_ops)
-            elif node_to_sub.value == 'x':
-                node_to_sub.value = 'const'
-            elif node_to_sub.value == 'const':
-                node_to_sub.value = 'x'
+            # elif node_to_sub.value == 'x':
+            #     node_to_sub.value = 'const'
+            # elif node_to_sub.value == 'const':
+            #     node_to_sub.value = 'x'
+            elif node_to_sub.value.startswith('x') or node_to_sub.value == 'const':
+                # Substitute terminal: either a const or another variable
+                new_val = random.choice(terminals)
+                while new_val == node_to_sub.value:
+                    new_val = random.choice(terminals)
+                node_to_sub.value = new_val
+            # else:
+            #     # Fallback (just replace node with same arity, defaulting to const)
+            #     new_node = EquationNode('const')
 
         elif action == 'perturb':
             # Slightly change a random constant

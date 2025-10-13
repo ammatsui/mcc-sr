@@ -109,10 +109,36 @@ if __name__ == "__main__":
         L_max=L_max,
         n_generations=5,
         batch_size=2,
-        logger=logger
+        logger=logger,
+        llm_enabled=False
     )
 
     eqs, gens = engine.run()
+
+    """Comparison!!!"""
+
+#     from pysr import PySRRegressor
+
+#     model = PySRRegressor(
+#     niterations=40,                  # Main compute knob (higher = better models)
+#     populations=5,
+#     model_selection="best",          # Option: "best" or "accuracy"
+#     unary_operators=["sin", "cos"],  # Operator set
+#     binary_operators=["+", "-", "*", "/"],
+# )
+
+#     model.fit(D0[0], D0[1])
+
+#     print("PySR discovered equations:")
+
+#     print(model.get_best())
+# Prints the best discovered equation
+
+# print(model.equations_)  
+# DataFrame with all tried equations, scores, complexities, etc.
+
+# score = model.score(D0[0], D0[1])
+# print("MSE:", score)
     
     # # --- Save results to files ---
     # with open("results_equations.txt", "w") as f_eq:
