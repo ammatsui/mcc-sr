@@ -104,24 +104,29 @@ class Equation:
         # print("Data shape:", x.shape)
         # print("Data:", x)
         assert x.ndim == 2 and x.shape[1] == self.n_variables
-
-        def _eval(node, const_counter=[0]):
+        n_samples = x.shape[0]
+        def _eval(node): #, const_counter=[0]):
             v = node.value
             #print("Evaluating node:", v)
             if v == 'const':
                 # Constants numbered by order of appearance during tree construction
                 # the value is stored in the node
                 idx = node.const_idx
-                const_counter[0] += 1
+                # const_counter[0] += 1
                 #print("Using constant index:", idx, "value:", self.constants[idx])
-                return self.constants[idx]
+                assert self.constants[idx] is not None, f"Constant {idx} not set."
+                return np.full(n_samples, self.constants[idx])
             elif v.startswith('x'):
                 vi = int(v[1:])
+                res = x[:, vi]
+                assert res.shape == (n_samples,), f"Variable x{vi} output shape {res.shape}"
                 return x[:, vi]
             elif v in {'+', '-', '*', '/', 'pow'}:
-                left = _eval(node.children[0], const_counter)
-                right = _eval(node.children[1], const_counter)
+                left = _eval(node.children[0])#, const_counter)
+                right = _eval(node.children[1])#, const_counter)
                 #print(f"Operator: {v}, Left: {left}, Right: {right}")
+                assert left.shape == (n_samples,), f"left output shape {left.shape} for op '{v}'"
+                assert right.shape == (n_samples,), f"right output shape {right.shape} for op '{v}'"
                 if v == '+': return left + right
                 if v == '-': return left - right
                 if v == '*': return left * right
@@ -133,13 +138,16 @@ class Equation:
                     return left / right_safe
                 if v == 'pow':
                     # Avoid complex results for negative bases and non-integer exponents
+                    # with np.errstate(invalid="ignore"):
+                    #     result = np.power(left, right)
+                    #     # fallback: replace nan/inf with large value
+                    #     result = np.where(np.isfinite(result), result, 1e6)
+                    # return result
                     with np.errstate(invalid="ignore"):
-                        result = np.power(left, right)
-                        # fallback: replace nan/inf with large value
-                        result = np.where(np.isfinite(result), result, 1e6)
-                    return result
+                        return np.where(np.isfinite(np.power(left, right)), np.power(left, right), 1e6)
             elif v in {'sin', 'cos'}:
-                child = _eval(node.children[0], const_counter)
+                child = _eval(node.children[0])#, const_counter)
+                assert child.shape == (n_samples,), f"child output shape {child.shape} for op '{v}'"
                 #print(f"Applying {v} to {child}")
                 if v == 'sin': return np.sin(child)
                 if v == 'cos': return np.cos(child)
@@ -148,13 +156,15 @@ class Equation:
 
         # Always reset per call
        
-        return _eval(self.root, [0])
+        return _eval(self.root)#, [0])
     
     def calculate_mse(self, x_data, y_data):
         """Calculate MSE with current constants (no fitting)."""
         y_pred = self.evaluate(x_data)
-        #print(y_pred)
-        mse = np.mean((y_pred - y_data)**2)
+        residuals = y_pred - y_data
+        residuals = np.where(np.isfinite(residuals), residuals, 0)  # Replace inf/nan with 0 or some sentinel
+        mse = np.mean(residuals ** 2)
+        # mse = np.mean((y_pred - y_data)**2)
         return mse
     
 
@@ -165,9 +175,15 @@ class Equation:
         """
         def residual(c):
             # Predict y using candidate constants
-            self.constants = c
+            self.constants = {k:v for k, v in enumerate(c)}
             y_pred = self.evaluate(x) #, constants=c)
-            res = (y_pred - y).flatten()
+            
+            y_pred = np.asarray(y_pred).flatten()
+            y1 = np.asarray(y).flatten()
+            if y_pred.shape != y1.shape:
+                raise ValueError(f"Shape mismatch: y_pred {y_pred.shape}, y {y.shape}")
+            
+            res = (y_pred - y1).flatten()
             # Mask nans/infs for optimizer
             res = np.where(np.isfinite(res), res, 1e6)
             return res
@@ -190,18 +206,43 @@ class Equation:
         # Run non-linear least squares fit
         result = least_squares(residual, initial_c)
         # Update self.constants to best found
-        self.constants = result.x
+        self.constants = self.constants = {k:v for k, v in enumerate(result.x)}
         # Compute and return MSE
         mse = np.mean(residual(result.x)**2)
         return mse
     
     def random_terminal(self):
         if random.random() < 0.5:
-            return EquationNode('const')
+            # Find new unique const_idx
+            used = set()
+            def collect(node):
+                if node.value == 'const':
+                    used.add(node.const_idx)
+                for child in node.children:
+                    collect(child)
+            collect(self.root)
+            max_idx = max(used) if used else -1
+            new_idx = max_idx + 1
+           
+            return EquationNode('const', const_idx=new_idx)
         else:
             var_idx = random.randint(0, self.n_variables - 1)
             return EquationNode(f'x{var_idx}')
-
+    
+    def remove_unused_constants(self):
+        used = set()
+        def collect(node):
+            if node.value == 'const':
+                used.add(node.const_idx)
+            for child in node.children:
+                collect(child)
+        collect(self.root)
+        # Keep only the constants in use
+        if isinstance(self.constants, dict):
+            self.constants = {k: v for k, v in self.constants.items() if k in used}
+        else:
+            # If it's an array/list, convert to dict or rebuild list as needed
+            self.constants = [self.constants[i] for i in sorted(used)]
 
     def mutate(self, action=None, node=None, value=None):
         """
@@ -278,7 +319,7 @@ class Equation:
                     node_to_delete = node
                     parent = next((p for n, p in candidates if n == node), None)
                 parent.children = [c for c in parent.children if c != node_to_delete]
-           
+            self.remove_unused_constants()
 
         elif action == 'substitute':
             # Replace a random node's value
@@ -298,7 +339,21 @@ class Equation:
                 new_val = random.choice(terminals)
                 while new_val == node_to_sub.value:
                     new_val = random.choice(terminals)
+                if new_val == 'const' and node_to_sub.const_idx is None:
+                    # Assign a new const_idx
+                    used = set()
+                    def collect(node):
+                        if node.value == 'const':
+                            used.add(node.const_idx)
+                        for child in node.children:
+                            collect(child)
+                    collect(mutant.root)
+                    max_idx = max(used) if used else -1
+                    new_idx = max_idx + 1
+                    node_to_sub.const_idx = new_idx
+                    mutant.constants[new_idx] = np.random.uniform(-2,2)
                 node_to_sub.value = new_val
+                self.remove_unused_constants()
             # else:
             #     # Fallback (just replace node with same arity, defaulting to const)
             #     new_node = EquationNode('const')

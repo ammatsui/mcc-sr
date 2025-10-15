@@ -24,13 +24,13 @@ def load_dataset(path):
 #     print("Random equation initialized:")
 #     print(equation)
 
-# print("Before fitting:", equation)
-# mse_before = equation.calculate_mse(D0[0], D0[1])
-# print("MSE before:", mse_before)
+#     print("Before fitting:", equation)
+#     mse_before = equation.calculate_mse(D0[0], D0[1])
+#     print("MSE before:", mse_before)
 
-# mse_after = equation.fit_constants(D0[0], D0[1])
-# print("After fitting:", equation)
-# print("MSE after:", mse_after)
+#     mse_after = equation.fit_constants(D0[0], D0[1])
+#     print("After fitting:", equation)
+#     print("MSE after:", mse_after)
 
 #     y = equation.evaluate(D0[0])
 #     print("Equation evaluated on anchor data.")
@@ -56,6 +56,9 @@ def load_dataset(path):
 #     print(xg)
 #     print(yg)
 
+#     equation.evaluate(xg)
+#     print("Equation evaluated on generated data.")
+#     print(equation.evaluate(xg))
 #     print("Mutated generator:")
 #     mutantg = generator.mutate()
 #     print(mutantg)
@@ -64,6 +67,8 @@ def load_dataset(path):
 #     print("Generator sampled data:")
 #     print(xg)
 #     print(yg)
+#     print("Equation evaluated on mutated generated data.")
+#     print(equation.evaluate(xg))
 
 
 
@@ -115,7 +120,7 @@ if __name__ == "__main__":
 
     eqs, gens = engine.run()
 
-    """Comparison!!!"""
+#     """Comparison!!!"""
 
 #     from pysr import PySRRegressor
 

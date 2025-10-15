@@ -99,6 +99,9 @@ class EvolutionEngine:
             passed_eqs = []
             for eq in eq_children:
                 # Refit constants (if structure mutated)
+                # print(self.anchor_x.shape)  # --> (n_samples, n_variables)
+                # print(self.anchor_y.shape)
+                assert self.anchor_x.shape[0] == self.anchor_y.shape[0]
                 eq.fit_constants(self.anchor_x, self.anchor_y)
                 # MC gate: must pass on anchor AND at least one generator
                 if eq_mc.is_viable(eq, [self.anchor_x, self.anchor_y], self.generator_queue):
