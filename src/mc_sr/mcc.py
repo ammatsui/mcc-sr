@@ -44,6 +44,9 @@ class GeneratorMC(MinimalCriterion):
         xg, yg = generator.sample()
         for eq in equations:
             mse = eq.calculate_mse(xg, yg)
+            # print("Generator MC check - Equation MSE on generated data:", mse)
+            # print("Threshold tau':", self.tau_prime)
+            # print("Comparison:", mse <= self.tau_prime)
             if mse <= self.tau_prime:
                 return True
         return False

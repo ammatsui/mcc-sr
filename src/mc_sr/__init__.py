@@ -77,17 +77,20 @@ def load_dataset(path):
 if __name__ == "__main__":
     # Load anchor dataset D0
     print("Loading anchor dataset...")
-    D0 = load_dataset('path') # user supplies filename
+    D0 = load_dataset('????') # user supplies filename
     D0 = (D0[0], D0[1])  #
     print("Anchor dataset loaded.")
 
     assert D0[0].shape[0] ==D0[1].shape[0] 
 
+
+    n_pop = 5
+
     # Initial seeds (example)
     # --- Create queues ---
-    equation_queue = [Equation.random_init(D0[0].shape[1]) for _ in range(50)]
+    equation_queue = [Equation.random_init(D0[0].shape[1]) for _ in range(n_pop)]
    # gen = Generator(anchor_data = D0)
-    generator_queue = [Generator.random_init(anchor_data = D0, mode = 'real') for _ in range(50)]
+    generator_queue = [Generator.random_init(anchor_data = D0, mode = 'real') for _ in range(n_pop)]
     print("Created initial equation and generator queues.")
     # Params
     params = {
@@ -106,8 +109,8 @@ if __name__ == "__main__":
     logger = MetricLogger()
 
     # --- Evolution settings ---
-    tau = 0.05
-    tau_prime = 0.07
+    tau = 1 # 0.05
+    tau_prime = 0.3 # 0.07
     L_max = 40
 
     engine = EvolutionEngine(
@@ -118,8 +121,8 @@ if __name__ == "__main__":
         tau=tau,
         tau_prime=tau_prime,
         L_max=L_max,
-        n_generations=100,
-        batch_size=2,
+        n_generations=40,
+        batch_size=5,
         logger=logger,
         llm_enabled=False
     )
@@ -135,30 +138,30 @@ if __name__ == "__main__":
 #     # print(os.environ.get("PATH"))
 #     # print(os.environ.get("JULIA_EXE"))
 #     # print("Importing PySR...")
-#     import pysr
-
-#     from pysr import PySRRegressor
-#     pysr.install()
-
-#     model = PySRRegressor(
-#     niterations=40,                  # Main compute knob (higher = better models)
-#     populations=5,
-#     model_selection="best",          # Option: "best" or "accuracy"
-#     unary_operators=["sin", "cos"],  # Operator set
-#     binary_operators=["+", "-", "*", "/"],
-# )
-
-#     model.fit(D0[0], D0[1])
-
-#     print("PySR discovered equations:")
-
-#     print(model.get_best())
 
 
-#     print(model.equations_)  
+    from pysr import PySRRegressor
 
-#     score = model.score(D0[0], D0[1])
-#     print("MSE:", score)
+
+    model = PySRRegressor(
+    niterations=40,                  # Main compute knob (higher = better models)
+    populations=5,
+    model_selection="best",          # Option: "best" or "accuracy"
+    unary_operators=["sin", "cos"],  # Operator set
+    binary_operators=["+", "-", "*", "/"],
+)
+
+    model.fit(D0[0], D0[1])
+
+    print("PySR discovered equations:")
+
+    print(model.get_best())
+
+
+    print(model.equations_)  
+
+    score = model.score(D0[0], D0[1])
+    print("MSE:", score)
     
     # # --- Save results to files ---
     # with open("results_equations.txt", "w") as f_eq:

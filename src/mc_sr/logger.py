@@ -4,7 +4,7 @@ class MetricLogger:
         self.log_file = log_file
 
     def log_generation(self, generation, tau, tau_prime, eq_passed, gen_passed, 
-                       eq_queue_size, gen_queue_size, equation_population, generators_population):
+                       eq_queue_size, gen_queue_size, equation_population, mse, generators_population):
         log_entry = dict(
             generation=generation,
             tau=tau,
@@ -14,6 +14,7 @@ class MetricLogger:
             eq_queue_size=eq_queue_size,
             gen_queue_size=gen_queue_size,
             equation_population = equation_population,
+            mse = mse,
             generators_population = generators_population
         )
         self.records.append(log_entry)
@@ -26,7 +27,9 @@ class MetricLogger:
                 f.write(f"Gen {generation}: {eq_passed} equations and {gen_passed} generators passed MC.\n")
                 f.write(f"  Queue sizes - Equations: {eq_queue_size}, Generators: {gen_queue_size}\n")
                 f.write(f"Equations: {[str(eq) for eq in equation_population]}\n")
+                f.write(f"MSE: {mse}\n")
                 f.write(f"Generators: {[str(gen) for gen in generators_population]}\n")
+                
 
     def to_dataframe(self):
         import pandas as pd

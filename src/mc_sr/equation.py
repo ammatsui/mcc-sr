@@ -191,6 +191,15 @@ class Equation:
         # mse = np.mean((y_pred - y_data)**2)
         return mse
     
+    def collect_used_const_indices(self):
+        used = set()
+        def walk(node):
+            if node.value == 'const':
+                used.add(node.const_idx)
+            for child in node.children:
+                walk(child)
+        walk(self.root)
+        return used
 
     def fit_constants(self, x, y, method="lsq"):
         """
@@ -199,7 +208,8 @@ class Equation:
         """
         def residual(c):
             # Predict y using candidate constants
-            self.constants = {k:v for k, v in enumerate(c)}
+            used_indices = self.collect_used_const_indices()
+            self.constants = {idx: c[i] for i, idx in enumerate(used_indices)}
             y_pred = self.evaluate(x) #, constants=c)
             
             y_pred = np.asarray(y_pred).flatten()
@@ -247,7 +257,7 @@ class Equation:
             collect(self.root)
             max_idx = max(used) if used else -1
             new_idx = max_idx + 1
-           
+            self.constants[new_idx] = np.random.uniform(-2,2)
             return EquationNode('const', const_idx=new_idx)
         else:
             var_idx = random.randint(0, self.n_variables - 1)
@@ -262,11 +272,8 @@ class Equation:
                 collect(child)
         collect(self.root)
         # Keep only the constants in use
-        if isinstance(self.constants, dict):
-            self.constants = {k: v for k, v in self.constants.items() if k in used}
-        else:
-            # If it's an array/list, convert to dict or rebuild list as needed
-            self.constants = [self.constants[i] for i in sorted(used)]
+        self.constants = {k: v for k, v in self.constants.items() if k in used}
+       
 
     def mutate(self, action=None, node=None, value=None):
         """
@@ -310,12 +317,12 @@ class Equation:
                 target = node
             # For binary ops, add two children; for unary, one
             if op in ['sin', 'cos']:
-                new_child = self.random_terminal()
+                new_child = mutant.random_terminal()
                 new_node = EquationNode(op, children = [new_child])
             # binary 
             else:
-                left = self.random_terminal()
-                right = self.random_terminal()
+                left = mutant.random_terminal()
+                right = mutant.random_terminal()
                 new_node = EquationNode(op, children = [left, right])
                 assert len(new_node.children) == 2
             # Insert as a new child (or replace one child if possible)
@@ -343,7 +350,7 @@ class Equation:
                     node_to_delete = node
                     parent = next((p for n, p in candidates if n == node), None)
                 parent.children = [c for c in parent.children if c != node_to_delete]
-            self.remove_unused_constants()
+            mutant.remove_unused_constants()
 
         elif action == 'substitute':
             # Replace a random node's value
@@ -359,25 +366,79 @@ class Equation:
             # elif node_to_sub.value == 'const':
             #     node_to_sub.value = 'x'
             elif node_to_sub.value.startswith('x') or node_to_sub.value == 'const':
-                # Substitute terminal: either a const or another variable
-                new_val = random.choice(terminals)
-                while new_val == node_to_sub.value:
+                terminal_nodes = [(n, p) for n, p in nodes if not n.children]
+                if terminal_nodes:
+                    node_to_sub, _ = random.choice(terminal_nodes)
+                    old_val = node_to_sub.value
                     new_val = random.choice(terminals)
-                if new_val == 'const' and node_to_sub.const_idx is None:
-                    # Assign a new const_idx
-                    used = set()
-                    def collect(node):
-                        if node.value == 'const':
-                            used.add(node.const_idx)
-                        for child in node.children:
-                            collect(child)
-                    collect(mutant.root)
-                    max_idx = max(used) if used else -1
-                    new_idx = max_idx + 1
-                    node_to_sub.const_idx = new_idx
-                    mutant.constants[new_idx] = np.random.uniform(-2,2)
-                node_to_sub.value = new_val
-                self.remove_unused_constants()
+                    while new_val == old_val:
+                        new_val = random.choice(terminals)
+                    # CASE 1: Substituting FROM variable TO const
+                    if old_val.startswith('x') and new_val == 'const':
+                        # Find unused const_idx
+                        used_const = set()
+                        def collect(node):
+                            if node.value == 'const' and node.const_idx is not None:
+                                used_const.add(node.const_idx)
+                            for child in node.children:
+                                collect(child)
+                        collect(mutant.root)
+                        max_idx = max(used_const) if used_const else -1
+                        new_idx = max_idx + 1
+                        node_to_sub.value = 'const'
+                        node_to_sub.const_idx = new_idx
+                        mutant.constants[new_idx] = np.random.uniform(-2,2)
+                    # CASE 2: Substituting FROM const TO variable
+                    elif old_val == 'const' and new_val.startswith('x'):
+                        # Remove const_idx reference
+                        if node_to_sub.const_idx is not None:
+                            # (The constant will be cleaned up in remove_unused_constants())
+                            node_to_sub.const_idx = None
+                        node_to_sub.value = new_val
+                    # CASE 3: Variable-to-variable or const-to-const
+                    else:
+                        node_to_sub.value = new_val
+                        # If it's a new 'const', assign index as above
+                        if new_val == 'const':
+                            if node_to_sub.const_idx is None:
+                                used_const = set()
+                                def collect(node):
+                                    if node.value == 'const' and node.const_idx is not None:
+                                        used_const.add(node.const_idx)
+                                    for child in node.children:
+                                        collect(child)
+                                collect(mutant.root)
+                                max_idx = max(used_const) if used_const else -1
+                                new_idx = max_idx + 1
+                                node_to_sub.const_idx = new_idx
+                                mutant.constants[new_idx] = np.random.uniform(-2,2)
+                        # If it's a variable, drop old const_idx
+                        elif new_val.startswith("x"):
+                            node_to_sub.const_idx = None
+                # After substitution, remove any no-longer-used constants
+                mutant.remove_unused_constants()
+
+
+                # # Substitute terminal: either a const or another variable
+                # new_val = random.choice(terminals)
+                # while new_val == node_to_sub.value:
+                #     new_val = random.choice(terminals)
+                # if new_val == 'const' and node_to_sub.const_idx is None:
+                #     # Assign a new const_idx
+                #     used = set()
+                #     def collect(node):
+                #         if node.value == 'const':
+                #             used.add(node.const_idx)
+                #         for child in node.children:
+                #             collect(child)
+                #     collect(mutant.root)
+                #     max_idx = max(used) if used else -1
+                #     new_idx = max_idx + 1
+                #     node_to_sub.const_idx = new_idx
+                #     mutant.constants[new_idx] = np.random.uniform(-2,2)
+                # node_to_sub.value = new_val
+                # mutant.constants[node_to_sub.const_idx] = np.random.uniform(-2,2)
+                # mutant.remove_unused_constants()
             # else:
             #     # Fallback (just replace node with same arity, defaulting to const)
             #     new_node = EquationNode('const')
@@ -393,6 +454,8 @@ class Equation:
         
         assert mutant is not None
         assert mutant.n_variables == self.n_variables
+        # self.remove_unused_constants()
+        mutant.remove_unused_constants()
         return mutant
     
     def to_prefix(self):
@@ -453,4 +516,9 @@ class Equation:
     def size(self):
         """ Return the number of nodes in the tree. """
         # Placeholder
-        raise NotImplementedError("Tree size not implemented")
+        def count_nodes(node):
+            total = 1  # Count this node
+            for child in node.children:
+                total += count_nodes(child)
+            return total
+        return count_nodes(self.root)

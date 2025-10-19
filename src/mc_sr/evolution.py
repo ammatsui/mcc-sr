@@ -87,13 +87,17 @@ class EvolutionEngine:
         eq_mc = EquationMC(self.tau, self.tau_prime, self.L_max)
         gen_mc = GeneratorMC(self.tau_prime)
         for generation in range(self.n_generations):
+            mse = []
             # ===== 1. SELECT PARENTS =====
             eq_parents = self.select_parents(self.equation_queue)
             gen_parents = self.select_parents(self.generator_queue)
 
+        
             # ===== 2. GENERATE CHILDREN =====
             eq_children = [e.mutate() for e in eq_parents]
             gen_children = [g.mutate() for g in gen_parents]
+
+           
 
             # ===== 3. EVALUATE EQUATIONS =====
             passed_eqs = []
@@ -103,6 +107,7 @@ class EvolutionEngine:
                 # print(self.anchor_y.shape)
                 assert self.anchor_x.shape[0] == self.anchor_y.shape[0]
                 eq.fit_constants(self.anchor_x, self.anchor_y)
+                mse.append(eq.calculate_mse(self.anchor_x, self.anchor_y))
                 # MC gate: must pass on anchor AND at least one generator
                 if eq_mc.is_viable(eq, [self.anchor_x, self.anchor_y], self.generator_queue):
                     self.equation_queue.append(eq)
@@ -133,6 +138,7 @@ class EvolutionEngine:
                 eq_queue_size=len(self.equation_queue),
                 gen_queue_size=len(self.generator_queue),
                 equation_population = self.equation_queue,
+                mse = mse,
                 generators_population = self.generator_queue
             )
             # print(f"Gen {generation}: {len(passed_eqs)} equations and {len(passed_gens)} generators passed MC.")
@@ -172,4 +178,13 @@ class EvolutionEngine:
             # ===== 9. END Generation =====
 
         # ===== 10. FINALIZE =====
+        print("Evolution complete.")
+        min_index = min(range(len(mse)), key=lambda i: mse[i])
+        min_mse = mse[min_index]
+        best_equation = eq_children[min_index]
+        assert best_equation.calculate_mse(self.anchor_x, self.anchor_y) == min_mse
+
+        # Usage:
+        print("Best MSE:", min_mse)
+        print("Best Equation:", str(best_equation))
         return self.equation_queue, self.generator_queue #, self.logger.metrics
