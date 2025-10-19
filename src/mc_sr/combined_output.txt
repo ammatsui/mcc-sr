@@ -1,0 +1,1659 @@
+
+
+==================== START OF FILE: cli.py ====================
+
+import argparse
+import numpy as np
+
+def calc_mse(x, y):
+    a, b, c = 1.0, 1.0, 1.7
+    y_pred = a * x ** 2 + b * np.sin(c * x)
+    return np.mean((y - y_pred) ** 2)
+
+def run_mwe(seed=123):
+    np.random.seed(seed)
+    x = np.linspace(-2, 2, 512)
+    y = np.sin(1.7 * x) + x ** 2 + np.random.normal(0, 0.02, x.shape)
+    mse = calc_mse(x, y)
+    print(f"MWE: Toy equation MSE = {mse:.6f}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    mwe_parser = subparsers.add_parser("mwe", help="Run minimal working example")
+    args = parser.parse_args()
+
+    if args.command == "mwe":
+        run_mwe()
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
+
+==================== START OF FILE: equation.py ====================
+
+""" Class for symbolic equations with tunable constants and tree structure."""
+
+# import numpy for vectorized operations
+import numpy as np
+from scipy.optimize import least_squares
+import random
+import copy
+
+PENALTY_VALUE = np.finfo(np.float64).max / 100
+
+operators = ['+', '-', '*', '/', 'sin', 'cos', 'pow']
+binary_ops = ['+', '-', '*', '/', 'pow']
+unary_ops = ['sin', 'cos']
+
+class EquationNode:
+    """
+    A node in the expression tree.
+    Each node can be an operator (like '+', '*', 'sin') or a terminal (like 'x' or a constant).
+    """
+    def __init__(self, value, const_idx=None, children=None):
+        self.value = value  # operator, variable, or constant
+        self.const_idx = const_idx
+        self.children = children or []  # list of child nodes
+        if self.value in binary_ops:
+            assert len(self.children) == 2, f"Binary operator {self.value} must have 2 children."
+        elif self.value in unary_ops:
+            assert len(self.children) == 1, f"Unary operator {self.value} must have 1 child."
+
+class Equation:
+    """
+    Represents a symbolic equation as an expression tree with tunable constants.
+    """
+    def __init__(self, root, n_variables = 1, constants=None):
+        """
+        root: EquationNode, the root of the tree.
+        constants: dict mapping names or indices to values (could be a list, array, or dict).
+        """
+        self.root = root
+        self.n_variables = n_variables # number of input variables
+        self.constants = constants if constants is not None else {}
+
+    @staticmethod
+    def random_init(n_vars, max_depth=3,
+                    operators=None,
+                    p_const=0.5,
+                    n_constants_range=(1, 4)):
+        """
+        Randomly initialize an equation (tree structure and constants).
+        
+        Parameters:
+            max_depth: int, maximum tree depth.
+            operators: list of operators to choose from.
+            p_const: float, probability to generate a constant node.
+            n_constants_range: tuple, min/max constants in the expression.
+        Returns:
+            Equation instance.
+        """
+        operators = operators or ['+', '-', '*', '/', 'sin', 'cos', 'pow']
+        constants = {}
+        const_indices = []
+        var_nodes = [f'x{i}' for i in range(n_vars)]
+        # print("Variable nodes:", var_nodes)
+
+        def build_node(depth):
+            if depth >= max_depth or (depth>0 and random.random()<0.3):
+                # Terminal node
+                if random.random() < p_const:
+                    idx = len(const_indices)
+                    const_indices.append(idx)
+                    return EquationNode('const', const_idx=idx)
+                else:
+                    var = random.choice(var_nodes)
+                    return EquationNode(var)
+            else:
+                op = random.choice(operators)
+                if op in ['sin', 'cos']:
+                    child = build_node(depth+1)
+                    return EquationNode(op, children = [child])
+                elif op == 'pow':
+                    left = build_node(depth+1)
+                    right = build_node(depth+1)
+                    return EquationNode(op, children = [left, right])
+                else:
+                    # binary
+                    left = build_node(depth+1)
+                    right = build_node(depth+1)
+                    return EquationNode(op, children = [left, right])
+
+        root = build_node(0)
+        # Initialize constants randomly, e.g. uniform [-2,2]
+        for idx in const_indices:
+            constants[idx] = np.random.uniform(-2,2)
+        eq = Equation(root, n_variables=n_vars, constants=constants)
+        # print(eq)
+        assert eq.n_variables == n_vars
+        assert eq is not None
+        return eq
+
+    def evaluate(self, x):
+        """ToDo: add support for multiple variables"""
+        """
+        Evaluate the equation for given x values.
+        x: float or np.ndarray
+        Returns: float or np.ndarray
+        """
+        # print("Data shape:", x.shape)
+        # print("Data:", x)
+        assert x.ndim == 2 and x.shape[1] == self.n_variables , f"Input x must have shape (n_samples, {self.n_variables}), but received shape {x.shape}"
+        n_samples = x.shape[0]
+        def _eval(node): #, const_counter=[0]):
+            v = node.value
+            #print("Evaluating node:", v)
+            if v == 'const':
+                # Constants numbered by order of appearance during tree construction
+                # the value is stored in the node
+                idx = node.const_idx
+                # const_counter[0] += 1
+                #print("Using constant index:", idx, "value:", self.constants[idx])
+                assert self.constants[idx] is not None, f"Constant {idx} not set."
+                return np.full(n_samples, self.constants[idx])
+            elif v.startswith('x'):
+                vi = int(v[1:])
+                res = x[:, vi]
+                assert res.shape == (n_samples,), f"Variable x{vi} output shape {res.shape}"
+                return x[:, vi]
+            elif v in {'+', '-', '*', '/', 'pow'}:
+                left = _eval(node.children[0])#, const_counter)
+                right = _eval(node.children[1])#, const_counter)
+                #print(f"Operator: {v}, Left: {left}, Right: {right}")
+                assert left.shape == (n_samples,), f"left output shape {left.shape} for op '{v}'"
+                assert right.shape == (n_samples,), f"right output shape {right.shape} for op '{v}'"
+                if v == '+': return left + right
+                if v == '-': return left - right
+                if v == '*': return left * right
+                if v == '/':
+                    # Avoid division by zero
+                    # Add small epsilon to denominator if needed
+                    # Robust division with per-element epsilon
+                    right_safe = np.where(np.abs(right) < 1e-8, 1e-8, right)
+                    return left / right_safe
+                if v == 'pow':
+                    # Avoid complex results for negative bases and non-integer exponents
+                    # with np.errstate(invalid="ignore"):
+                    #     result = np.power(left, right)
+                    #     # fallback: replace nan/inf with large value
+                    #     result = np.where(np.isfinite(result), result, 1e6)
+                    # return result
+                    with np.errstate(invalid="ignore"):
+                        return np.where(np.isfinite(np.power(left, right)), np.power(left, right), PENALTY_VALUE)
+            elif v in {'sin', 'cos'}:
+                child = _eval(node.children[0])#, const_counter)
+                assert child.shape == (n_samples,), f"child output shape {child.shape} for op '{v}'"
+                #print(f"Applying {v} to {child}")
+                if v == 'sin': return np.sin(child)
+                if v == 'cos': return np.cos(child)
+            else:
+                raise ValueError(f"Unknown node value: {v}")
+
+        # Always reset per call
+       
+        return _eval(self.root)#, [0])
+    
+    def calculate_mse(self, x_data, y_data):
+        """Calculate MSE with current constants (no fitting)."""
+        y_pred = self.evaluate(x_data)
+        residuals = y_pred - y_data
+        residuals = np.where(np.isfinite(residuals), residuals, 0)  # Replace inf/nan with 0 or some sentinel
+        mse = np.mean(residuals ** 2)
+        # mse = np.mean((y_pred - y_data)**2)
+        return mse
+    
+
+    def fit_constants(self, x, y, method="lsq"):
+        """
+        Fit or optimize the constants of the equation so that self.evaluate(x_data) matches y_data (min MSE).
+        Returns MSE after fitting.
+        """
+        def residual(c):
+            # Predict y using candidate constants
+            self.constants = {k:v for k, v in enumerate(c)}
+            y_pred = self.evaluate(x) #, constants=c)
+            
+            y_pred = np.asarray(y_pred).flatten()
+            y1 = np.asarray(y).flatten()
+            if y_pred.shape != y1.shape:
+                raise ValueError(f"Shape mismatch: y_pred {y_pred.shape}, y {y.shape}")
+            
+            res = (y_pred - y1).flatten()
+            # Mask nans/infs for optimizer
+            res = np.where(np.isfinite(res), res, 1e6)
+            return res
+        
+        def count_param_nodes(node):
+            count = 1  # Each node has a constant
+            for child in node.children:
+                count += count_param_nodes(child)
+            return count
+        
+        # Initial guess: use current constants or 1s
+        initial_c = np.array(
+            [self.constants.get(i, 1.0) for i in range(len(self.constants))]
+            ) if isinstance(self.constants, dict) else np.array(self.constants)
+        if initial_c.size == 0:  # fallback if not set
+            # number of constants = number of nodes in the tree
+            num_consts = count_param_nodes(self.root)
+            initial_c = np.ones(num_consts)
+        
+        # Run non-linear least squares fit
+        result = least_squares(residual, initial_c)
+        # Update self.constants to best found
+        self.constants = self.constants = {k:v for k, v in enumerate(result.x)}
+        # Compute and return MSE
+        mse = np.mean(residual(result.x)**2)
+        return mse
+    
+    def random_terminal(self):
+        if random.random() < 0.5:
+            # Find new unique const_idx
+            used = set()
+            def collect(node):
+                if node.value == 'const':
+                    used.add(node.const_idx)
+                for child in node.children:
+                    collect(child)
+            collect(self.root)
+            max_idx = max(used) if used else -1
+            new_idx = max_idx + 1
+           
+            return EquationNode('const', const_idx=new_idx)
+        else:
+            var_idx = random.randint(0, self.n_variables - 1)
+            return EquationNode(f'x{var_idx}')
+    
+    def remove_unused_constants(self):
+        used = set()
+        def collect(node):
+            if node.value == 'const':
+                used.add(node.const_idx)
+            for child in node.children:
+                collect(child)
+        collect(self.root)
+        # Keep only the constants in use
+        if isinstance(self.constants, dict):
+            self.constants = {k: v for k, v in self.constants.items() if k in used}
+        else:
+            # If it's an array/list, convert to dict or rebuild list as needed
+            self.constants = [self.constants[i] for i in sorted(used)]
+
+    def mutate(self, action=None, node=None, value=None):
+        """
+        Randomly mutate tree structure, operator, terminals or constants.
+        Actions:
+        - Insert: Add a new random operator or sub-expression at a node.
+        - Delete: Remove a sub-tree or node.
+        - Substitute: Replace an operator, a terminal, or a constant.
+        - Perturb constants: Slightly change a numeric constant.
+        """
+        import random
+        actions = ['insert', 'delete', 'substitute', 'perturb']
+        if action is None:
+            action = random.choice(actions)
+
+        terminals = ['const'] + [f'x{i}' for i in range(self.n_variables)]
+
+        mutant = copy.deepcopy(self)
+
+        def get_all_nodes(node, parent=None, nodes=None):
+            if nodes is None:
+                nodes = []
+            nodes.append((node, parent))
+            for child in node.children:
+                get_all_nodes(child, node, nodes)
+            return nodes
+
+        nodes = get_all_nodes(mutant.root)
+
+        if action == 'insert':
+            # Insert a random operator/subtree at a random node
+            if value is None:
+                op_choices = ['+', '-', '*', '/', 'sin', 'cos', 'pow']
+                op = random.choice(op_choices)
+            else:
+                op = value
+            # Choose a random target node to insert at
+            if node is None:
+                target, _ = random.choice(nodes)
+            else:
+                target = node
+            # For binary ops, add two children; for unary, one
+            if op in ['sin', 'cos']:
+                new_child = self.random_terminal()
+                new_node = EquationNode(op, children = [new_child])
+            # binary 
+            else:
+                left = self.random_terminal()
+                right = self.random_terminal()
+                new_node = EquationNode(op, children = [left, right])
+                assert len(new_node.children) == 2
+            # Insert as a new child (or replace one child if possible)
+            target.children.append(new_node)
+
+        elif action == 'delete':
+            # Remove a random node (not root)
+            
+            non_root_nodes = [(n, p) for n, p in nodes if p is not None]
+            candidates = []
+            for n, p in non_root_nodes:
+                if p.value in binary_ops:
+                    # Deleting a child would leave <2 children: illegal, skip
+                    if len(p.children) <= 2:
+                        continue
+                if p.value in unary_ops:
+                    # Deleting a child would leave <1 child: illegal, skip
+                    if len(p.children) <= 1:
+                        continue
+                candidates.append((n, p))
+            if candidates:
+                if node is None:
+                    node_to_delete, parent = random.choice(candidates)
+                else:
+                    node_to_delete = node
+                    parent = next((p for n, p in candidates if n == node), None)
+                parent.children = [c for c in parent.children if c != node_to_delete]
+            self.remove_unused_constants()
+
+        elif action == 'substitute':
+            # Replace a random node's value
+            if node is None:
+                node_to_sub, _ = random.choice(nodes)
+            # Change operator, variable, or constant
+            if node_to_sub.value in unary_ops:
+                node_to_sub.value = random.choice(unary_ops)
+            elif node_to_sub.value in binary_ops:
+                node_to_sub.value = random.choice(binary_ops)
+            # elif node_to_sub.value == 'x':
+            #     node_to_sub.value = 'const'
+            # elif node_to_sub.value == 'const':
+            #     node_to_sub.value = 'x'
+            elif node_to_sub.value.startswith('x') or node_to_sub.value == 'const':
+                # Substitute terminal: either a const or another variable
+                new_val = random.choice(terminals)
+                while new_val == node_to_sub.value:
+                    new_val = random.choice(terminals)
+                if new_val == 'const' and node_to_sub.const_idx is None:
+                    # Assign a new const_idx
+                    used = set()
+                    def collect(node):
+                        if node.value == 'const':
+                            used.add(node.const_idx)
+                        for child in node.children:
+                            collect(child)
+                    collect(mutant.root)
+                    max_idx = max(used) if used else -1
+                    new_idx = max_idx + 1
+                    node_to_sub.const_idx = new_idx
+                    mutant.constants[new_idx] = np.random.uniform(-2,2)
+                node_to_sub.value = new_val
+                self.remove_unused_constants()
+            # else:
+            #     # Fallback (just replace node with same arity, defaulting to const)
+            #     new_node = EquationNode('const')
+
+        elif action == 'perturb':
+            # Slightly change a random constant
+            if isinstance(mutant.constants, dict) and mutant.constants:
+                k = random.choice(list(mutant.constants.keys()))
+                mutant.constants[k] += np.random.normal(scale=0.1)
+            elif isinstance(mutant.constants, (list, np.ndarray)) and len(mutant.constants) > 0:
+                idx = random.randint(0, len(mutant.constants)-1)
+                mutant.constants[idx] += np.random.normal(scale=0.1)
+        
+        assert mutant is not None
+        assert mutant.n_variables == self.n_variables
+        return mutant
+    
+    def to_prefix(self):
+        """
+        Return list of tokens (prefix notation) for the tree, useful for speciation/clustering.
+        """
+        # Placeholder: implement tree traversal here
+        raise NotImplementedError("Prefix conversion not implemented")
+    
+    def _to_infix(self, node):
+        """
+        Recursively convert tree to infix notation string.
+        Supports unary and binary operators.
+        """
+        # Terminal node: variable or constant
+        if not node.children:
+            if node.value == "const":
+                # Assume constants are indexed by order
+                idx = node.const_idx
+                return str(self.constants[idx])
+            return str(node.value)
+        
+        # Unary operators (e.g., sin, cos)
+        if len(node.children) == 1:
+            return f"{node.value}({self._to_infix(node.children[0])})"
+        
+        # Binary operators (e.g., +, -, *, /, pow)
+        if len(node.children) == 2:
+            left = self._to_infix(node.children[0])
+            right = self._to_infix(node.children[1])
+            # For 'pow', print as **
+            if node.value == "pow":
+                return f"({left})**({right})"
+            return f"({left} {node.value} {right})"
+        
+        # Unknown arity
+        return f"{node.value}({', '.join(self._to_infix(child) for child in node.children)})"
+    
+    def __str__(self):
+        """
+        Pretty-print the equation in infix notation.
+        """
+        return f"Equation constants: {self.constants}\nTree:  {self._to_infix(self.root)}"
+
+    # def __str__(self):
+    #     """
+    #     String representation of the equation (for debugging and logging).
+    #     """
+    #     # Could print as infix or prefix notation, include constants
+    #     return f"Equation constants: {self.constants}\nTree: {self.to_prefix()}"
+
+    # -- additional methods you might need --
+    def depth(self):
+        """ Return the max depth of the tree. """
+        # Placeholder
+        raise NotImplementedError("Tree depth not implemented")
+    
+    def size(self):
+        """ Return the number of nodes in the tree. """
+        # Placeholder
+        raise NotImplementedError("Tree size not implemented")
+
+==================== START OF FILE: evolution.py ====================
+
+""" evolutionary step for calling mutation example:
+
+def evolutionary_step(equation, llm, use_llm=False):
+    # Use LLM if triggered, otherwise classical mutate
+    if use_llm:
+        return llm_mutate(equation, llm)
+    else:
+        return equation.mutate()  # classical random mutation
+"""
+from equation import Equation
+from generator import Generator
+from mcc import EquationMC, GeneratorMC
+from logger import MetricLogger
+import random, numpy
+from llm_integration import LLMMutator
+
+                # Initialize LLM Mutator
+                
+
+class EvolutionEngine:
+    def __init__(self, equation_queue, generator_queue, anchor_x, anchor_y, 
+                 tau, tau_prime, L_max,
+                 n_generations=100, batch_size=10, logger=None, llm_enabled=False):
+        for eq in equation_queue:
+            if eq is None:
+                raise RuntimeError("Equation queue returned None!")
+        self.equation_queue = equation_queue
+        self.generator_queue = generator_queue
+        self.anchor_x = anchor_x
+        self.anchor_y = anchor_y
+        self.tau = tau
+        self.tau_prime = tau_prime
+        self.L_max = L_max
+        self.n_generations = n_generations
+        self.batch_size = batch_size
+        self.logger = logger
+        self.mc_pass_history = []              # Counts of MC passes each gen
+        self.coverage_grid_history = []        # Cells filled per gen (optional)
+        self.stagnation_window = 30            # How many generations to look back
+        self.stagnation_min_passes = 0         # Min passes to avoid stagnation
+        self.llm_enabled = llm_enabled         # Toggle for LLM mutation
+        if self.llm_enabled:
+            self.llm = LLMMutator()             # Initialize LLM mutator
+            print("LLM integration enabled.")
+        else:
+            self.llm = None
+        # add any other state you want to track (species, metrics, etc.)
+
+    # def log_generation_metrics(self, passed_eqs, passed_gens):
+    #     mc_passes = len(passed_eqs) + len(passed_gens)
+    #     self.mc_pass_history.append(mc_passes)
+
+    def select_parents(self, queue):
+        """Uniform random parent selection from a single viable queue."""
+        # If queue is smaller than batch_size, sample with replacement for infinite reproduction
+        if len(queue) == 0:
+            raise ValueError("Cannot select parents: queue is empty.")
+        return random.choices(queue, k=self.batch_size)
+    
+    def trim_queue(self, queue):
+        """Trim queue to max size by removing oldest entries."""
+        while len(queue) > self.L_max:
+            queue.pop(0)  # remove oldest
+
+    def update_thresholds(self):
+        # ToDo: Update MC thresholds - do we need it?
+        pass 
+
+    def check_stagnation(self):
+        """
+        Returns True if no new individuals have passed MC in the last N generations.
+        """
+        history = self.mc_pass_history
+        window = self.stagnation_window
+        min_passes = self.stagnation_min_passes
+        # Only check if we've run enough generations
+        if len(history) < window:
+            return False
+        recent = history[-window:]
+        return sum(recent) <= min_passes
+    
+    def run(self):
+        """
+        Main evolution loop. Handles population management, mutation, evaluation,
+        logging, and adaptive MC gating.
+        """
+        eq_mc = EquationMC(self.tau, self.tau_prime, self.L_max)
+        gen_mc = GeneratorMC(self.tau_prime)
+        for generation in range(self.n_generations):
+            # ===== 1. SELECT PARENTS =====
+            eq_parents = self.select_parents(self.equation_queue)
+            gen_parents = self.select_parents(self.generator_queue)
+
+            # ===== 2. GENERATE CHILDREN =====
+            eq_children = [e.mutate() for e in eq_parents]
+            gen_children = [g.mutate() for g in gen_parents]
+
+            # ===== 3. EVALUATE EQUATIONS =====
+            passed_eqs = []
+            for eq in eq_children:
+                # Refit constants (if structure mutated)
+                # print(self.anchor_x.shape)  # --> (n_samples, n_variables)
+                # print(self.anchor_y.shape)
+                assert self.anchor_x.shape[0] == self.anchor_y.shape[0]
+                eq.fit_constants(self.anchor_x, self.anchor_y)
+                # MC gate: must pass on anchor AND at least one generator
+                if eq_mc.is_viable(eq, [self.anchor_x, self.anchor_y], self.generator_queue):
+                    self.equation_queue.append(eq)
+                    passed_eqs.append(eq)
+                    self.trim_queue(self.equation_queue)
+        
+            # ===== 4. EVALUATE GENERATORS =====
+            passed_gens = []
+            for gen in gen_children:
+                if gen_mc.is_viable(gen, self.equation_queue):
+                    self.generator_queue.append(gen)
+                    passed_gens.append(gen)
+                    self.trim_queue(self.generator_queue)
+
+            # # ===== 5. ADAPT THRESHOLDS =====
+            # # Example: update tau to 25th percentile of anchor MSEs from last k successful equations
+            # self.tau = self.update_thresholds(self.recent_eq_anchor_mse, 0.25)
+            # self.tau_prime = self.update_thresholds(self.recent_eq_generator_mse, 0.25)
+
+            # self.log_generation_metrics(passed_eqs, passed_gens)
+            # ===== 7. LOG METRICS AND PASS-FAIL STATS =====
+            self.logger.log_generation(
+                generation=generation,
+                tau=self.tau,
+                tau_prime=self.tau_prime,
+                eq_passed=len(passed_eqs),
+                gen_passed=len(passed_gens),
+                eq_queue_size=len(self.equation_queue),
+                gen_queue_size=len(self.generator_queue),
+                equation_population = self.equation_queue,
+                generators_population = self.generator_queue
+            )
+            # print(f"Gen {generation}: {len(passed_eqs)} equations and {len(passed_gens)} generators passed MC.")
+            # print(f"  Queue sizes - Equations: {len(self.equation_queue)}, Generators: {len(self.generator_queue)}")
+            # print(f"Equations: {[str(eq) for eq in self.equation_queue]}")
+            # print(f"Generators: {[str(gen) for gen in self.generator_queue]}")
+            # ===== 8. OPTIONAL: LLM TRIGGERS, COVERAGE GRID =====
+            if self.llm_enabled and self.check_stagnation():
+                print("Stagnation detected. Triggering LLM mutation...")
+                eq_to_mutate = random.choice(eq_children)
+                # Export your equation as string (or other format)
+                eq_str = str(eq_to_mutate)
+
+                # Get LLM-suggested mutation
+                with open(self.logger.log_file, "r") as f:
+                    data = f.read()
+
+                mutation = self.llm.propose_eq_mutation(eq_str, context=data)
+                if mutation:
+                    # Apply mutation to create new equation
+                    new_eq = self.llm.apply_eq_mutation(eq_to_mutate, mutation)
+                    if new_eq:
+                        self.equation_queue.append(new_eq)
+                        self.trim_queue(self.equation_queue)
+                        # print(f"LLM mutation applied: {mutation}")
+                else:
+                    print("LLM did not propose a valid mutation.")
+               
+                
+                # gen_to_mutate = random.choice(gen_children)
+                # gen_to_mutate = gen_to_mutate.mutate()
+                # self.generator_queue.append(gen_to_mutate)
+        
+            # if self.use_map_elites:
+            #     self.update_coverage_grid(passed_eqs, passed_gens)
+
+            # ===== 9. END Generation =====
+
+        # ===== 10. FINALIZE =====
+        return self.equation_queue, self.generator_queue #, self.logger.metrics
+
+==================== START OF FILE: extract.py ====================
+
+import os
+
+def aggregate_files_to_single_txt(directory='.'):
+    """
+    Copies the content of all files in the given directory (excluding the 
+    output file itself) into a single text file.
+    
+    Args:
+        directory (str): The path to the directory to process. Defaults to 
+                         the current directory ('.').
+    """
+    # Define the name of the output file
+    output_filename = "combined_output.txt"
+    
+    # Resolve the full path for the output file
+    output_path = os.path.join(directory, output_filename)
+    
+    print(f"Starting aggregation process in directory: {os.path.abspath(directory)}")
+    
+    # Use a 'with open' block for the output file to ensure it's closed properly
+    with open(output_path, 'w', encoding='utf-8') as outfile:
+        
+        # Iterate over all items in the specified directory
+        for item_name in os.listdir(directory):
+            
+            item_path = os.path.join(directory, item_name)
+            
+            # 1. Skip the output file to prevent an infinite loop/error
+            if item_name == output_filename:
+                continue
+                
+            # 2. Only process files (not subdirectories)
+            if os.path.isfile(item_path):
+                
+                # Create a clear separator header
+                separator = f"\n\n==================== START OF FILE: {item_name} ====================\n\n"
+                outfile.write(separator)
+                
+                try:
+                    # Read the content of the current file
+                    with open(item_path, 'r', encoding='utf-8') as infile:
+                        content = infile.read()
+                        outfile.write(content)
+                        
+                    print(f"  - Successfully added content from: {item_name}")
+
+                except UnicodeDecodeError:
+                    # Handle files that are not simple text (e.g., binary files)
+                    error_msg = f"\n[!] WARNING: Could not read {item_name} (Possible binary file). Skipping content.\n"
+                    outfile.write(error_msg)
+                    print(f"  - Skipped (Unicode Error): {item_name}")
+                except Exception as e:
+                    # Handle other potential errors
+                    error_msg = f"\n[!] ERROR reading {item_name}: {e}\n"
+                    outfile.write(error_msg)
+                    print(f"  - Skipped (Error): {item_name}")
+
+    print(f"\nAggregation complete! All contents saved to: {output_filename}")
+
+# --- Execution ---
+
+# Note: This script will run in the directory where you save and execute it.
+# If you want to specify a different directory, change the argument below:
+# For example: aggregate_files_to_single_txt('/path/to/my/folder')
+aggregate_files_to_single_txt()
+
+==================== START OF FILE: generator.py ====================
+
+"""Class for generating sample datasets from the given big dataset."""
+
+
+import numpy as np
+import random
+import copy
+
+class Generator:
+    def __init__(self, anchor_data, n_variables, input_range=(-2, 2), px='uniform', n_g=512, sigma_y=0.02, unit_scale=1.0, transform_flags=None, mode="benchmark", f_star=None):
+        """
+        Parameters
+        ----------
+        input_range   : tuple, range for x
+        px            : str, distribution name ('uniform' or 'normal')
+        n_g           : int, number of samples
+        sigma_y       : float, output noise standard deviation
+        unit_scale    : float, scaling factor for units
+        transform_flags: dict or None, augmentation flags/settings
+        anchor_data   : tuple (X_anchor, y_anchor) for real-data mode
+        mode          : 'benchmark' or 'real'
+        f_star        : function(x), true law (for benchmarks mode)
+        """
+        self.input_range = input_range
+        self.px = px
+        self.n_g = n_g
+        self.sigma_y = sigma_y
+        self.unit_scale = unit_scale
+        self.transform_flags = transform_flags or {}
+        self.anchor_data = anchor_data
+        self.n_variables = n_variables
+        if anchor_data is not None:
+            self.n_variables = anchor_data[0].shape[1]
+        self.mode = mode
+        self.f_star = f_star
+
+
+    @staticmethod
+    def random_init(mode='benchmark',
+                    input_range_choices=[(-2, 2), (-5, 5), (0, 1), (-1, 3)],
+                    px_choices=['uniform', 'normal'],
+                    n_g_range=(256, 1024),
+                    sigma_y_range=(0.005, 0.05),
+                    unit_scale_range=(0.5, 2.0),
+                    transform_flag_pool=('aug', 'flip', 'scale'),
+                    anchor_data=None,
+                    f_star=None):
+        """
+        Returns a randomly initialized Generator instance.
+        
+        Parameters
+        ----------
+            mode: 'benchmark' or 'real'
+            input_range_choices: list of tuples for possible input ranges
+            px_choices: list of possible distribution names
+            n_g_range: tuple (min, max) for sample size
+            sigma_y_range: tuple (min, max) for output noise
+            unit_scale_range: tuple (min, max) for scaling
+            transform_flag_pool: tuple/list of possible transform flags
+            anchor_data: if mode=='real'
+            f_star: if mode=='benchmark'
+        """
+        
+        input_range = random.choice(input_range_choices)
+        px = random.choice(px_choices)
+        n_g = random.randint(n_g_range[0], n_g_range[1])
+        sigma_y = np.random.uniform(*sigma_y_range)
+        unit_scale = np.random.uniform(*unit_scale_range)
+        
+        # Random transform flags: each with random True/False
+        transform_flags = {k: bool(random.getrandbits(1)) for k in transform_flag_pool}
+        
+        # If benchmark, need a function f_star
+        # if mode == 'benchmark' and f_star is None:
+        #     # Example: f(x) = sin(x) + x^2
+        #     f_star = lambda x: np.sin(x) + x**2
+        
+        # If real, need anchor_data (or leave as None)
+        # anchor_data should be provided externally if wanted
+
+        gen = Generator(
+            input_range=input_range,
+            px=px,
+            n_g=n_g,
+            sigma_y=sigma_y,
+            unit_scale=unit_scale,
+            transform_flags=transform_flags,
+            anchor_data=anchor_data,
+            n_variables=anchor_data[0].shape[1] if anchor_data is not None else 1,
+            mode=mode,
+            f_star=f_star
+        )
+        return gen
+
+    def sample(self):
+        """
+        Materialize a dataset variant D_g = {(x_i, y_i)} of length n_g.
+
+        Returns
+        -------
+        x : numpy array
+        y : numpy array
+        """
+        if self.mode == "benchmark" and self.f_star is not None:
+            # 1. Sample x_i according to px (within input_range)
+            low, high = self.input_range
+            if self.px == 'uniform':
+                x = np.random.uniform(low, high, self.n_g)
+            elif self.px == 'normal':
+                x = np.random.normal((low+high)/2, (high-low)/4, self.n_g)
+            else:
+                raise ValueError("Unknown px type")
+            # 2. Apply unit rescaling if needed
+            x = self.unit_scale * x
+            # 3. Generate y_i using f_star (true law) + noise
+            y = self.f_star(x) + np.random.normal(0, self.sigma_y, self.n_g)
+            # 4. Any additional transforms
+            # (can implement more via transform_flags)
+           
+            return x.reshape(-1, 1), y
+
+        elif self.mode == "real" and self.anchor_data is not None:
+            X_anchor, y_anchor = self.anchor_data
+            # 1. Bootstrap/subsample
+            idx = np.random.choice(len(X_anchor), self.n_g, replace=True)
+            x = X_anchor[idx]
+            y = y_anchor[idx]
+            # 2. Unit/scale transform
+            x = self.unit_scale * x
+            y = self.unit_scale * y
+            # 3. Mild label noise
+            y = y + np.random.normal(0, self.sigma_y, self.n_g)
+            # 4. Any transform_flags logic here
+            assert x.shape == (self.n_g, self.n_variables)
+            assert y.shape == (self.n_g, )
+            return x, y
+
+        else:
+            raise ValueError("Improper configuration for generator")
+        
+    def mutate(self):
+        """
+        Randomly mutate one parameter (range, noise, unit_scale, etc).
+        Mutation means altering data-creation parameters:
+        - Input range: Expand/narrow or shift sampling interval for x.
+        - Noise level: Increase or decrease σ (sigma) for added label noise.
+        - Distribution type: Switch between, e.g., uniform and normal.
+        - Sample size: Adjust n_g up/down.
+        - Unit/scaling: Modify scaling coefficient for x or y.
+        - Transform flags: Toggle augmentation options, e.g., enable/disable a specific data transform.
+        """
+        import random
+        mutation_types = ['input_range', 'noise', 'distribution', 'sample_size', 'unit_scale', 'transform_flag']
+        mutation = random.choice(mutation_types)
+
+        mutant = copy.deepcopy(self)
+
+        if mutation == 'input_range':
+            # Expand, narrow, or shift interval
+            low, high = self.input_range
+            action = random.choice(['expand', 'narrow', 'shift'])
+            delta = (high - low) * 0.1
+            if action == 'expand':
+                mutant.input_range = (low - delta, high + delta)
+            elif action == 'narrow' and (high - low) > 2 * delta:
+                mutant.input_range = (low + delta, high - delta)
+            elif action == 'shift':
+                shift = random.uniform(-delta, delta)
+                mutant.input_range = (low + shift, high + shift)
+
+        elif mutation == 'noise':
+            # Increase or decrease sigma_y
+            factor = random.choice([0.8, 1.2])
+            mutant.sigma_y = max(1e-6, self.sigma_y * factor)
+
+        elif mutation == 'distribution':
+            # Switch between uniform and normal
+            mutant.px = 'normal' if self.px == 'uniform' else 'uniform'
+
+        elif mutation == 'sample_size':
+            # Adjust n_g up/down
+            change = random.choice([-32, 32])
+            mutant.n_g = max(1, self.n_g + change)
+
+        elif mutation == 'unit_scale':
+            # Modify scaling coefficient
+            factor = random.choice([0.9, 1.1])
+            mutant.unit_scale *= factor
+
+        elif mutation == 'transform_flag':
+            # Toggle a random transform flag
+            if self.transform_flags:
+                key = random.choice(list(self.transform_flags.keys()))
+                mutant.transform_flags[key] = not self.transform_flags[key]
+            else:
+                # Add a random flag if none exist
+                mutant.transform_flags['aug'] = True
+
+        return mutant
+
+    def to_vector(self):
+        """Return generator parameters for clustering/species assignment."""
+        return np.array([self.input_range[0], self.input_range[1], self.n_g, self.sigma_y, self.unit_scale])
+
+    def __str__(self):
+        return (f"Generator(mode={self.mode}, range={self.input_range}, "
+                f"n_g={self.n_g}, sigma_y={self.sigma_y}, unit={self.unit_scale})")
+
+==================== START OF FILE: llm_integration.py ====================
+
+import openai  # or anthropic, or other LLM API
+
+class LLMMutator:
+    def __init__(self, api_key, model="gpt-4"):
+        openai.api_key = api_key
+        self.model = model
+
+    def propose_mutation(self, equation_tree_str, context=None):
+        """Send the equation (as string/tree) to the LLM, get mutation proposal."""
+        prompt = self.build_prompt(equation_tree_str, context)
+        response = self.query_llm(prompt)
+        mutation = self.parse_mutation_response(response)
+        return mutation
+    
+    def build_prompt(self, eq_str, context=None):
+        # Make this descriptive for your task
+        prompt = (
+            "Here is an equation tree:\n" + eq_str +
+            "\nSuggest a single symbolic mutation as a JSON dictionary (action, target_node, new_value):"
+        )
+        if context:
+            prompt += f"\nContext: here is the information from the past evolution history: {context}"
+        return prompt
+    
+    def query_llm(self, prompt):
+        # Call out to the LLM (OpenAI example, modify for your backend)
+        response = openai.ChatCompletion.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=256,
+            temperature=0.8
+        )
+        return response["choices"][0]["message"]["content"]
+
+    def parse_mutation_response(self, llm_output):
+        # Convert the response from string/JSON to Python dict
+        import json
+        try:
+            return json.loads(llm_output)
+        except Exception as e:
+            raise RuntimeError(f"Bad LLM output: {llm_output}") from e
+        
+    def apply_eq_mutation(self, equation, mutation):    
+        """Apply the mutation to the equation tree, return new equation."""
+        # This depends on your Equation class structure
+        # new_eq = equation.copy()  # Assume a copy method
+        action = mutation.get("action")
+        target_node = mutation.get("target_node")
+        new_value = mutation.get("new_value")
+        
+        new_eq = equation.mutate(action = action, target_node=target_node, new_value=new_value)
+        print(f"\nApplied LLM mutation: {mutation} to equation {equation} -> {new_eq}\n")
+        return new_eq
+
+==================== START OF FILE: log.txt ====================
+
+Gen 0: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 1: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 2: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 3: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 4: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 5: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 6: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 7: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 8: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 9: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 10: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 11: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 12: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 13: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 14: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 15: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 16: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 17: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 18: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 19: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 20: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 21: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 22: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 23: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 24: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 25: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 26: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 27: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 28: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 29: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 30: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 31: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 32: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 33: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 34: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 35: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 36: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 37: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 38: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 39: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 40: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 41: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 42: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 43: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 44: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 45: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 46: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 47: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 48: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 49: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 50: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 51: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 52: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 53: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 54: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 55: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 56: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 57: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 58: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 59: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 60: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 61: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 62: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 63: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 64: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 65: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 66: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 67: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 68: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 69: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 70: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 71: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 72: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 73: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 74: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 75: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 76: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 77: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 78: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 79: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 80: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 81: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 82: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 83: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 84: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 85: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 86: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 87: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 88: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 89: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 90: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 91: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 92: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 93: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 94: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 95: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 96: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 97: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 98: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+Gen 99: 0 equations and 0 generators passed MC.
+  Queue sizes - Equations: 5, Generators: 5
+Equations: ['Equation constants: {0: 0.9775553830642192}\nTree:  (sin((x2 - 0.9775553830642192)) + cos(x9))', 'Equation constants: {0: -0.061279131257124586, 1: -0.8521758714955219}\nTree:  (sin(-0.061279131257124586) / cos(cos(-0.8521758714955219)))', 'Equation constants: {0: -1.7629895418300108}\nTree:  sin(sin((x27)**(-1.7629895418300108)))', 'Equation constants: {0: -0.5671122179271024}\nTree:  sin(((x74)**(-0.5671122179271024))**(x38))', 'Equation constants: {0: 0.4707691028416696}\nTree:  (0.4707691028416696 * x57)']
+Generators: ['Generator(mode=real, range=(-2, 2), n_g=508, sigma_y=0.010065627818129742, unit=1.4305222321550526)', 'Generator(mode=real, range=(-2, 2), n_g=757, sigma_y=0.008671375851294173, unit=1.9341928163292768)', 'Generator(mode=real, range=(0, 1), n_g=949, sigma_y=0.038911399197592865, unit=1.2281486638013692)', 'Generator(mode=real, range=(0, 1), n_g=782, sigma_y=0.0081828614444456, unit=1.9474749350153968)', 'Generator(mode=real, range=(-2, 2), n_g=974, sigma_y=0.03447966476358111, unit=1.5051047958137156)']
+
+
+==================== START OF FILE: logger.py ====================
+
+class MetricLogger:
+    def __init__(self, log_file="log.txt"):
+        self.records = []
+        self.log_file = log_file
+
+    def log_generation(self, generation, tau, tau_prime, eq_passed, gen_passed, 
+                       eq_queue_size, gen_queue_size, equation_population, generators_population):
+        log_entry = dict(
+            generation=generation,
+            tau=tau,
+            tau_prime=tau_prime,
+            eq_passed=eq_passed,
+            gen_passed=gen_passed,
+            eq_queue_size=eq_queue_size,
+            gen_queue_size=gen_queue_size,
+            equation_population = equation_population,
+            generators_population = generators_population
+        )
+        self.records.append(log_entry)
+        if self.log_file:
+            # Optionally write to file/CSV immediately
+            # import json
+            # with open(self.log_file, "a") as f:
+            #     f.write(json.dumps(log_entry) + '\n')
+            with open(self.log_file, "a") as f:  # 'a' mode appends
+                f.write(f"Gen {generation}: {eq_passed} equations and {gen_passed} generators passed MC.\n")
+                f.write(f"  Queue sizes - Equations: {eq_queue_size}, Generators: {gen_queue_size}\n")
+                f.write(f"Equations: {[str(eq) for eq in equation_population]}\n")
+                f.write(f"Generators: {[str(gen) for gen in generators_population]}\n")
+
+    def to_dataframe(self):
+        import pandas as pd
+        return pd.DataFrame(self.records)
+
+==================== START OF FILE: mcc.py ====================
+
+"""Classes for evaluation metrics (minimal criterion) on equations and generators."""
+
+from abc import ABC, abstractmethod
+from equation import Equation
+from generator import Generator
+
+class MinimalCriterion(ABC):
+    @abstractmethod
+    def is_viable(self, candidate, *args, **kwargs):
+        """Return True if candidate passes MC, False otherwise."""
+        pass
+
+class EquationMC(MinimalCriterion):
+    def __init__(self, tau, tau_prime, L_max):
+        self.tau = tau # mse threshold on anchor data
+        self.tau_prime = tau_prime # mse threshold on generated data
+        self.L_max = L_max # max tree size
+
+    def is_viable(self, equation, D0, generators):
+        # 1. Fit constants on anchor, check threshold 
+        """NOTE: maybe fit on each generated dataset when fitting instead?"""
+        # print("Fitting equation on anchor data for MC check...")
+        mse_anchor = equation.fit_constants(D0[0], D0[1])
+        # print("MSE on anchor after fitting:", mse_anchor)
+        if mse_anchor > self.tau:
+            return False
+        # 2. Check if the equation fits at lease one generated dataset
+        for gen in generators:
+            xg, yg = gen.sample()
+            mse_gen = equation.calculate_mse(xg, yg)
+            if mse_gen <= self.tau_prime:
+                # 3. Check tree size
+                if equation.size() <= self.L_max:
+                    return True
+        return False
+
+class GeneratorMC(MinimalCriterion):
+    def __init__(self, tau_prime):
+        self.tau_prime = tau_prime # mse threshold on generated data
+
+    def is_viable(self, generator, equations):
+        # Checks if the generated data fits at least one equation
+        """NOTE: maybe add fitting constants here as well?"""
+        xg, yg = generator.sample()
+        for eq in equations:
+            mse = eq.calculate_mse(xg, yg)
+            if mse <= self.tau_prime:
+                return True
+        return False
+
+==================== START OF FILE: __init__.py ====================
+
+from equation import Equation
+from generator import Generator
+from evolution import EvolutionEngine
+from logger import MetricLogger
+import numpy as np
+import json
+import random
+
+
+
+
+
+def load_dataset(path):
+    # Loads anchor dataset D0 from SRBench .csv or .json
+    # Returns X shape [n, d], y shape [n,]
+    data = np.genfromtxt(path, delimiter='\t', skip_header=1)
+    X = data[:, :-1]
+    y = data[:, -1]
+    return X, y
+
+# if __name__ == "__main__":
+#     D0= load_dataset('./dataset/I.6.2.txt') # user supplies filename
+#     print("Anchor dataset loaded.")
+#     print("X shape:", D0[0].shape)
+#     equation = Equation.random_init(D0[0].shape[1])
+#     print("Random equation initialized:")
+#     print(equation)
+
+#     print("Before fitting:", equation)
+#     mse_before = equation.calculate_mse(D0[0], D0[1])
+#     print("MSE before:", mse_before)
+
+#     mse_after = equation.fit_constants(D0[0], D0[1])
+#     print("After fitting:", equation)
+#     print("MSE after:", mse_after)
+
+#     y = equation.evaluate(D0[0])
+#     print("Equation evaluated on anchor data.")
+#     print(y)
+
+
+#     equation.fit_constants(D0[0], D0[1])
+#     print("Constants fitted.")
+#     print(equation)
+
+#     print("Mutated equation:")
+#     mutant = equation.mutate()
+#     print(mutant)
+#     print("Mutant evaluated on anchor data.")
+#     print(mutant.evaluate(D0[0]))
+    
+#     generator = Generator.random_init(anchor_data=D0)
+#     print("Random generator initialized:")
+#     print(generator)
+
+#     xg, yg = generator.sample()
+#     print("Generator sampled data:")
+#     print(xg)
+#     print(yg)
+
+#     equation.evaluate(xg)
+#     print("Equation evaluated on generated data.")
+#     print(equation.evaluate(xg))
+#     print("Mutated generator:")
+#     mutantg = generator.mutate()
+#     print(mutantg)
+#     print("Mutant sampled.")
+#     xg, yg = mutantg.sample()
+#     print("Generator sampled data:")
+#     print(xg)
+#     print(yg)
+#     print("Equation evaluated on mutated generated data.")
+#     print(equation.evaluate(xg))
+
+
+
+if __name__ == "__main__":
+    # Load anchor dataset D0
+    print("Loading anchor dataset...")
+    D0 = load_dataset('C:/Users/matsu/Downloads/Hill_Valley_with_noise.tsv.gz') # user supplies filename
+    D0 = (D0[0], D0[1])  #
+    print("Anchor dataset loaded.")
+
+    assert D0[0].shape[0] ==D0[1].shape[0] 
+
+    # Initial seeds (example)
+    # --- Create queues ---
+    equation_queue = [Equation.random_init(D0[0].shape[1]) for _ in range(5)]
+   # gen = Generator(anchor_data = D0)
+    generator_queue = [Generator.random_init(anchor_data = D0, mode = 'real') for _ in range(5)]
+    print("Created initial equation and generator queues.")
+    # Params
+    params = {
+        'tau_init': 1e-2, 
+        'taup_init': 1e-2,
+        'Lmax': 8,
+        'n_generations': 100,
+        'delta_eq': 0.2,
+        'delta_gen': 0.25,
+        'k_generators': 3,
+        'tau_quantile': 0.25,
+        'llm_trigger_gens': 30
+    }
+
+     # --- Logger ---
+    logger = MetricLogger()
+
+    # --- Evolution settings ---
+    tau = 0.05
+    tau_prime = 0.07
+    L_max = 40
+
+    engine = EvolutionEngine(
+        equation_queue=equation_queue,
+        generator_queue=generator_queue,
+        anchor_x=D0[0],
+        anchor_y=D0[1],
+        tau=tau,
+        tau_prime=tau_prime,
+        L_max=L_max,
+        n_generations=100,
+        batch_size=2,
+        logger=logger,
+        llm_enabled=False
+    )
+
+    eqs, gens = engine.run()
+
+    
+
+    """Comparison!!!"""
+    import os
+    # os.environ["JULIA_EXE"] = r"C:\\Users\\matsu\\AppData\\Local\\Programs\\Julia-1.10.10\\bin\\julia.exe"
+    # print("Environment PATH:")
+    # print(os.environ.get("PATH"))
+    # print(os.environ.get("JULIA_EXE"))
+    # print("Importing PySR...")
+    import pysr
+
+    from pysr import PySRRegressor
+    pysr.install()
+
+    model = PySRRegressor(
+    niterations=40,                  # Main compute knob (higher = better models)
+    populations=5,
+    model_selection="best",          # Option: "best" or "accuracy"
+    unary_operators=["sin", "cos"],  # Operator set
+    binary_operators=["+", "-", "*", "/"],
+)
+
+    model.fit(D0[0], D0[1])
+
+    print("PySR discovered equations:")
+
+    print(model.get_best())
+
+
+    print(model.equations_)  
+
+    score = model.score(D0[0], D0[1])
+    print("MSE:", score)
+    
+    # # --- Save results to files ---
+    # with open("results_equations.txt", "w") as f_eq:
+    #     for eq in eqs:
+    #         f_eq.write(str(eq) + "\n")
+            
+    # with open("results_generators.txt", "w") as f_gen:
+    #     for gen in gens:
+    #         f_gen.write(str(gen) + "\n")
+    
+    # with open("results_metrics.json", "w") as f_metrics:
+    #     json.dump(metrics, f_metrics, indent=2)
+
+    # print("Results saved to results_equations.txt, results_generators.txt, and results_metrics.json")
+
+
+print("Done.")
+# __all__ = [
+#     "Equation",
+#     "Generator",
+#     "EvolutionEngine",
+#     "run_evolution_demo",
+# ]

@@ -6,7 +6,7 @@ import random
 import copy
 
 class Generator:
-    def __init__(self, anchor_data, input_range=(-2, 2), px='uniform', n_g=512, sigma_y=0.02, unit_scale=1.0, transform_flags=None, mode="benchmark", f_star=None):
+    def __init__(self, anchor_data, n_variables, input_range=(-2, 2), px='uniform', n_g=512, sigma_y=0.02, unit_scale=1.0, transform_flags=None, mode="benchmark", f_star=None):
         """
         Parameters
         ----------
@@ -27,6 +27,9 @@ class Generator:
         self.unit_scale = unit_scale
         self.transform_flags = transform_flags or {}
         self.anchor_data = anchor_data
+        self.n_variables = n_variables
+        if anchor_data is not None:
+            self.n_variables = anchor_data[0].shape[1]
         self.mode = mode
         self.f_star = f_star
 
@@ -67,9 +70,9 @@ class Generator:
         transform_flags = {k: bool(random.getrandbits(1)) for k in transform_flag_pool}
         
         # If benchmark, need a function f_star
-        if mode == 'benchmark' and f_star is None:
-            # Example: f(x) = sin(x) + x^2
-            f_star = lambda x: np.sin(x) + x**2
+        # if mode == 'benchmark' and f_star is None:
+        #     # Example: f(x) = sin(x) + x^2
+        #     f_star = lambda x: np.sin(x) + x**2
         
         # If real, need anchor_data (or leave as None)
         # anchor_data should be provided externally if wanted
@@ -82,6 +85,7 @@ class Generator:
             unit_scale=unit_scale,
             transform_flags=transform_flags,
             anchor_data=anchor_data,
+            n_variables=anchor_data[0].shape[1] if anchor_data is not None else 1,
             mode=mode,
             f_star=f_star
         )
@@ -126,6 +130,8 @@ class Generator:
             # 3. Mild label noise
             y = y + np.random.normal(0, self.sigma_y, self.n_g)
             # 4. Any transform_flags logic here
+            assert x.shape == (self.n_g, self.n_variables)
+            assert y.shape == (self.n_g, )
             return x, y
 
         else:

@@ -6,6 +6,8 @@ from scipy.optimize import least_squares
 import random
 import copy
 
+PENALTY_VALUE = 1e6
+
 operators = ['+', '-', '*', '/', 'sin', 'cos', 'pow']
 binary_ops = ['+', '-', '*', '/', 'pow']
 unary_ops = ['sin', 'cos']
@@ -103,7 +105,7 @@ class Equation:
         """
         # print("Data shape:", x.shape)
         # print("Data:", x)
-        assert x.ndim == 2 and x.shape[1] == self.n_variables
+        assert x.ndim == 2 and x.shape[1] == self.n_variables , f"Input x must have shape (n_samples, {self.n_variables}), but received shape {x.shape}"
         n_samples = x.shape[0]
         def _eval(node): #, const_counter=[0]):
             v = node.value
@@ -134,8 +136,11 @@ class Equation:
                     # Avoid division by zero
                     # Add small epsilon to denominator if needed
                     # Robust division with per-element epsilon
-                    right_safe = np.where(np.abs(right) < 1e-8, 1e-8, right)
-                    return left / right_safe
+                    right_safe = np.where(np.abs(right) < 1e-6, np.sign(right)*1e-6, right)
+                    out = left / right_safe
+                    out = np.where(np.isfinite(out), out, PENALTY_VALUE)
+                   
+                    return out
                 if v == 'pow':
                     # Avoid complex results for negative bases and non-integer exponents
                     # with np.errstate(invalid="ignore"):
@@ -143,14 +148,33 @@ class Equation:
                     #     # fallback: replace nan/inf with large value
                     #     result = np.where(np.isfinite(result), result, 1e6)
                     # return result
-                    with np.errstate(invalid="ignore"):
-                        return np.where(np.isfinite(np.power(left, right)), np.power(left, right), 1e6)
-            elif v in {'sin', 'cos'}:
-                child = _eval(node.children[0])#, const_counter)
+                    with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+                        # Limit exponents to avoid overflow (clip at reasonable large number)
+                        left_clip = np.clip(left, -1e2, 1e2)
+                        right_clip = np.clip(right, -10, 10)
+                        result = np.power(left_clip, right_clip)
+                        result = np.where(np.isfinite(result), result, PENALTY_VALUE)
+                    return result
+            if v == 'sin': 
+                child = _eval(node.children[0])
                 assert child.shape == (n_samples,), f"child output shape {child.shape} for op '{v}'"
-                #print(f"Applying {v} to {child}")
-                if v == 'sin': return np.sin(child)
-                if v == 'cos': return np.cos(child)
+           
+                out = np.sin(child)
+                out = np.where(np.isfinite(out), out, PENALTY_VALUE)
+                return out
+            if v == 'cos': 
+                child = _eval(node.children[0])
+                assert child.shape == (n_samples,), f"child output shape {child.shape} for op '{v}'"
+            
+                out = np.cos(child)
+                out = np.where(np.isfinite(out), out, PENALTY_VALUE)
+                return out
+            # elif v in {'sin', 'cos'}:
+            #     child = _eval(node.children[0])#, const_counter)
+            #     assert child.shape == (n_samples,), f"child output shape {child.shape} for op '{v}'"
+            #     #print(f"Applying {v} to {child}")
+            #     if v == 'sin': return np.sin(child)
+            #     if v == 'cos': return np.cos(child)
             else:
                 raise ValueError(f"Unknown node value: {v}")
 
@@ -366,7 +390,9 @@ class Equation:
             elif isinstance(mutant.constants, (list, np.ndarray)) and len(mutant.constants) > 0:
                 idx = random.randint(0, len(mutant.constants)-1)
                 mutant.constants[idx] += np.random.normal(scale=0.1)
-
+        
+        assert mutant is not None
+        assert mutant.n_variables == self.n_variables
         return mutant
     
     def to_prefix(self):

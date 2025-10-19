@@ -19,7 +19,9 @@ class EquationMC(MinimalCriterion):
     def is_viable(self, equation, D0, generators):
         # 1. Fit constants on anchor, check threshold 
         """NOTE: maybe fit on each generated dataset when fitting instead?"""
+        # print("Fitting equation on anchor data for MC check...")
         mse_anchor = equation.fit_constants(D0[0], D0[1])
+        # print("MSE on anchor after fitting:", mse_anchor)
         if mse_anchor > self.tau:
             return False
         # 2. Check if the equation fits at lease one generated dataset
