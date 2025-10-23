@@ -7,11 +7,11 @@ def evolutionary_step(equation, llm, use_llm=False):
     else:
         return equation.mutate()  # classical random mutation
 """
-from equation import Equation
+from equation import Equation, crossover
 from generator import Generator
 from mcc import EquationMC, GeneratorMC
 from logger import MetricLogger
-import random, numpy
+import random, numpy as np
 from llm_integration import LLMMutator
 
                 # Initialize LLM Mutator
@@ -20,7 +20,7 @@ from llm_integration import LLMMutator
 class EvolutionEngine:
     def __init__(self, equation_queue, generator_queue, anchor_x, anchor_y, 
                  tau, tau_prime, L_max,
-                 n_generations=100, batch_size=10, logger=None, llm_enabled=False):
+                 n_generations=100, batch_size=10, crossover_rate = 5, logger=None, llm_enabled=False):
         for eq in equation_queue:
             if eq is None:
                 raise RuntimeError("Equation queue returned None!")
@@ -33,6 +33,7 @@ class EvolutionEngine:
         self.L_max = L_max
         self.n_generations = n_generations
         self.batch_size = batch_size
+        self.crossover_rate = crossover_rate
         self.logger = logger
         self.mc_pass_history = []              # Counts of MC passes each gen
         self.coverage_grid_history = []        # Cells filled per gen (optional)
@@ -97,6 +98,17 @@ class EvolutionEngine:
             eq_children = [e.mutate() for e in eq_parents]
             gen_children = [g.mutate() for g in gen_parents]
 
+
+            # Apply crossover
+            if generation % self.crossover_rate == 0:
+                # Perform crossover between random pairs of equations
+                num_crossovers = max(1, len(eq_parents) // 10)  # Example: 10% of the queue
+                for _ in range(num_crossovers):
+                    parent1, parent2 = random.sample(eq_parents, 2)
+                    child1, child2 = crossover(parent1, parent2)
+                    eq_children.append(child1)
+                    eq_children.append(child2)
+                    # self.trim_queue(self.equation_queue)
            
 
             # ===== 3. EVALUATE EQUATIONS =====
@@ -129,18 +141,7 @@ class EvolutionEngine:
 
             # self.log_generation_metrics(passed_eqs, passed_gens)
             # ===== 7. LOG METRICS AND PASS-FAIL STATS =====
-            self.logger.log_generation(
-                generation=generation,
-                tau=self.tau,
-                tau_prime=self.tau_prime,
-                eq_passed=len(passed_eqs),
-                gen_passed=len(passed_gens),
-                eq_queue_size=len(self.equation_queue),
-                gen_queue_size=len(self.generator_queue),
-                equation_population = self.equation_queue,
-                mse = mse,
-                generators_population = self.generator_queue
-            )
+            
             # print(f"Gen {generation}: {len(passed_eqs)} equations and {len(passed_gens)} generators passed MC.")
             # print(f"  Queue sizes - Equations: {len(self.equation_queue)}, Generators: {len(self.generator_queue)}")
             # print(f"Equations: {[str(eq) for eq in self.equation_queue]}")
@@ -166,8 +167,36 @@ class EvolutionEngine:
                         # print(f"LLM mutation applied: {mutation}")
                 else:
                     print("LLM did not propose a valid mutation.")
-               
-                
+
+            
+            self.logger.log_generation(
+                generation=generation,
+                tau=self.tau,
+                tau_prime=self.tau_prime,
+                eq_passed=len(passed_eqs),
+                gen_passed=len(passed_gens),
+                eq_queue_size=len(self.equation_queue),
+                gen_queue_size=len(self.generator_queue),
+                equation_population = self.equation_queue,
+                mse = mse,
+                generators_population = self.generator_queue
+            )
+
+            self.logger.log_generation_csv(file="generation_log.csv",
+                    gen_num=generation,
+                    tau=self.tau,
+                    tau_prime=self.tau_prime,
+                    eq_mses_anchor=[eq.calculate_mse(self.anchor_x, self.anchor_y) for eq in eq_children],
+                    # eq_mses_gen=[min([eq.calculate_mse(*gen.sample()) for gen in self.generator_queue]) for eq in eq_children],
+                    eq_tree_sizes=[eq.size() for eq in eq_children],
+                    num_eq_passed=len(passed_eqs),
+                    num_gen_passed=len(passed_gens),
+                    eq_queue_size=len(self.equation_queue),
+                    gen_queue_size=len(self.generator_queue)
+            )
+            # update constraints
+            self.tau = np.percentile(mse, 0.25)
+            self.tau_prime = np.percentile(mse, 0.4)
                 # gen_to_mutate = random.choice(gen_children)
                 # gen_to_mutate = gen_to_mutate.mutate()
                 # self.generator_queue.append(gen_to_mutate)
@@ -182,7 +211,9 @@ class EvolutionEngine:
         min_index = min(range(len(mse)), key=lambda i: mse[i])
         min_mse = mse[min_index]
         best_equation = eq_children[min_index]
-        assert best_equation.calculate_mse(self.anchor_x, self.anchor_y) == min_mse
+        best_mse = best_equation.calculate_mse(self.anchor_x, self.anchor_y)
+       
+        assert abs(best_mse - min_mse) < 1e-5, f"Best equation MSE f{best_mse} does not match recorded min MSE f{min_mse}!"
 
         # Usage:
         print("Best MSE:", min_mse)

@@ -201,7 +201,7 @@ class Equation:
         walk(self.root)
         return used
 
-    def fit_constants(self, x, y, method="lsq"):
+    def fit_constants(self, x, y, method="lsq", n_restarts=5, bounds=(-10,10)):
         """
         Fit or optimize the constants of the equation so that self.evaluate(x_data) matches y_data (min MSE).
         Returns MSE after fitting.
@@ -236,14 +236,44 @@ class Equation:
             # number of constants = number of nodes in the tree
             num_consts = count_param_nodes(self.root)
             initial_c = np.ones(num_consts)
-        
-        # Run non-linear least squares fit
-        result = least_squares(residual, initial_c)
-        # Update self.constants to best found
-        self.constants = self.constants = {k:v for k, v in enumerate(result.x)}
-        # Compute and return MSE
-        mse = np.mean(residual(result.x)**2)
-        return mse
+        # print("Initial constants for fitting:", self.constants)
+        # # Run non-linear least squares fit
+        # result = least_squares(residual, initial_c)
+        # # Update self.constants to best found
+        # self.constants = self.constants = {k:v for k, v in enumerate(result.x)}
+        # # Compute and return MSE
+        # mse = np.mean(residual(result.x)**2)
+        # return mse
+
+        # add restarts to optimise constant fitting
+        best_mse = np.inf
+        best_constants = initial_c
+        for restart in range(n_restarts):
+            initial_guess = np.random.uniform(bounds[0], bounds[1], size=initial_c.size)
+            assert initial_guess.shape == initial_c.shape
+            try:
+                result = least_squares(residual, initial_guess) #, initial_guess bounds=bounds)
+                mse = np.mean(residual(result.x)**2)
+                if mse < best_mse:
+                    best_mse = mse
+                    best_constants = result.x
+                    # print(f"Restart {restart}: Found better MSE {best_mse}")
+                    # print(f"Constants: {best_constants}")
+                    assert best_constants.shape == initial_c.shape
+            except Exception as e:
+                # Optionally log exceptions
+                pass
+        assert best_constants is not None
+        res_const = {}
+        for k in (self.collect_used_const_indices()):
+            for v in best_constants:
+                res_const[k] = v
+        # res_const = {k: v for k, v in (self.collect_used_const_indices(), best_constants)}
+        assert len(self.constants) == len(res_const), f"with {len(self.constants)} vs {len(res_const)} constants after fitting"
+        self.constants = res_const
+        return best_mse
+    
+
     
     def random_terminal(self):
         if random.random() < 0.5:
@@ -273,7 +303,8 @@ class Equation:
         collect(self.root)
         # Keep only the constants in use
         self.constants = {k: v for k, v in self.constants.items() if k in used}
-       
+
+     
 
     def mutate(self, action=None, node=None, value=None):
         """
@@ -285,7 +316,7 @@ class Equation:
         - Perturb constants: Slightly change a numeric constant.
         """
         import random
-        actions = ['insert', 'delete', 'substitute', 'perturb']
+        actions = ['insert', 'delete', 'substitute', 'perturb', 'grow']
         if action is None:
             action = random.choice(actions)
 
@@ -356,15 +387,14 @@ class Equation:
             # Replace a random node's value
             if node is None:
                 node_to_sub, _ = random.choice(nodes)
+            else:
+                node_to_sub = node
             # Change operator, variable, or constant
             if node_to_sub.value in unary_ops:
                 node_to_sub.value = random.choice(unary_ops)
             elif node_to_sub.value in binary_ops:
                 node_to_sub.value = random.choice(binary_ops)
-            # elif node_to_sub.value == 'x':
-            #     node_to_sub.value = 'const'
-            # elif node_to_sub.value == 'const':
-            #     node_to_sub.value = 'x'
+
             elif node_to_sub.value.startswith('x') or node_to_sub.value == 'const':
                 terminal_nodes = [(n, p) for n, p in nodes if not n.children]
                 if terminal_nodes:
@@ -418,31 +448,6 @@ class Equation:
                 # After substitution, remove any no-longer-used constants
                 mutant.remove_unused_constants()
 
-
-                # # Substitute terminal: either a const or another variable
-                # new_val = random.choice(terminals)
-                # while new_val == node_to_sub.value:
-                #     new_val = random.choice(terminals)
-                # if new_val == 'const' and node_to_sub.const_idx is None:
-                #     # Assign a new const_idx
-                #     used = set()
-                #     def collect(node):
-                #         if node.value == 'const':
-                #             used.add(node.const_idx)
-                #         for child in node.children:
-                #             collect(child)
-                #     collect(mutant.root)
-                #     max_idx = max(used) if used else -1
-                #     new_idx = max_idx + 1
-                #     node_to_sub.const_idx = new_idx
-                #     mutant.constants[new_idx] = np.random.uniform(-2,2)
-                # node_to_sub.value = new_val
-                # mutant.constants[node_to_sub.const_idx] = np.random.uniform(-2,2)
-                # mutant.remove_unused_constants()
-            # else:
-            #     # Fallback (just replace node with same arity, defaulting to const)
-            #     new_node = EquationNode('const')
-
         elif action == 'perturb':
             # Slightly change a random constant
             if isinstance(mutant.constants, dict) and mutant.constants:
@@ -451,6 +456,49 @@ class Equation:
             elif isinstance(mutant.constants, (list, np.ndarray)) and len(mutant.constants) > 0:
                 idx = random.randint(0, len(mutant.constants)-1)
                 mutant.constants[idx] += np.random.normal(scale=0.1)
+
+        elif action == 'grow':
+            # replace random node with a random subtree of random length
+            if node is None:
+                node, parent = random.choice(nodes)  
+            
+            new_subtree = Equation.random_init(
+                n_vars=self.n_variables, max_depth=np.random.randint(0,10)
+            )
+
+            # insert new_subtree in place of node
+            if parent is None:
+                mutant.root = new_subtree.root
+            else:
+                for i, child in enumerate(parent.children):
+                    if child == node:
+                        parent.children[i] = new_subtree.root
+                        break
+            # fix constants sync
+            def reindex_subtree_constants(subtree_root, new_constants, mutant):
+            # subtree_root: root node of the newly attached subtree
+            # new_constants: dict from new_subtree.constants (old_idx -> value)
+            # mutant: equation instance receiving the subtree
+
+                def traverse(node):
+                    # Do a recursive traversal
+                    if node.value == 'const':
+                        # Assign new globally unique index
+                        max_idx = max(mutant.constants.keys()) if mutant.constants else -1
+                        new_idx = max_idx + 1
+                        old_idx = node.const_idx  # index from new_subtree
+                        node.const_idx = new_idx  # update the node to use new index
+                        mutant.constants[new_idx] = new_constants.get(old_idx, np.random.uniform(-2,2))
+                    for child in node.children:
+                        traverse(child)
+
+                traverse(subtree_root)
+
+            # After attaching new_subtree.root in mutant...
+            reindex_subtree_constants(new_subtree.root, new_subtree.constants, mutant)
+
+
+            
         
         assert mutant is not None
         assert mutant.n_variables == self.n_variables
@@ -522,3 +570,76 @@ class Equation:
                 total += count_nodes(child)
             return total
         return count_nodes(self.root)
+    
+    
+    
+def crossover(eq1, eq2):
+    """
+    Perform subtree crossover between two Equation instances, ensuring operator arity is preserved.
+    Returns two offspring (deepcopies).
+    """
+    import copy
+    offspring1 = copy.deepcopy(eq1)
+    offspring2 = copy.deepcopy(eq2)
+
+    # Helper: get all (node, parent, child_index) triples
+    def get_all_nodes(node, parent=None, nodes=None):
+        if nodes is None:
+            nodes = []
+        if parent is not None:
+            idx = parent.children.index(node)
+        else:
+            idx = None
+        nodes.append((node, parent, idx))
+        for child in node.children:
+            get_all_nodes(child, node, nodes)
+        return nodes
+
+    nodes1 = get_all_nodes(offspring1.root)
+    nodes2 = get_all_nodes(offspring2.root)
+
+    # Only consider non-root nodes for crossover
+    nonroot_nodes1 = [(n, p, idx) for n, p, idx in nodes1 if p is not None]
+    nonroot_nodes2 = [(n, p, idx) for n, p, idx in nodes2 if p is not None]
+
+    # Filter candidates so swapped subtrees have compatible arity for their parent location
+    candidates = []
+    for n1, p1, idx1 in nonroot_nodes1:
+        for n2, p2, idx2 in nonroot_nodes2:
+            # Parent op expects a child of a specific arity; child at swap point must match
+            if len(n1.children) == len(n2.children):  # same arity
+                candidates.append(((n1, p1, idx1), (n2, p2, idx2)))
+
+    if candidates:
+        # Pick a random compatible pair
+        (n1, p1, idx1), (n2, p2, idx2) = random.choice(candidates)
+        # Swap the subtrees
+        p1.children[idx1], p2.children[idx2] = n2, n1
+
+        # traverse trees to sync new constants
+        crossed_nodes1 = get_all_nodes(n2)
+        crossed_nodes2 = get_all_nodes(n1)
+        for node, _, _ in crossed_nodes1:
+            # for constants in offspring1, assign constant value from eq2 and vice versa
+            # also update the const_idx 
+            if node.value == 'const':
+                idx = node.const_idx
+                # Assign a new constant value
+                max_idx = max(offspring1.constants.keys()) if offspring1.constants else -1
+                new_idx = max_idx + 1
+                node.const_idx = new_idx
+                offspring1.constants[new_idx] = eq2.constants[idx]
+
+        for node, _, _ in crossed_nodes2:
+            if node.value == 'const':
+                idx = node.const_idx
+                max_idx = max(offspring2.constants.keys()) if offspring2.constants else -1
+                new_idx = max_idx + 1
+                node.const_idx = new_idx
+                offspring2.constants[new_idx] = eq1.constants[idx]
+
+        offspring1.remove_unused_constants()
+        offspring2.remove_unused_constants()
+    # else: No compatible crossover points found; return deep copies unchanged
+
+    return offspring1, offspring2

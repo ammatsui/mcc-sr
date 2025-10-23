@@ -77,14 +77,21 @@ def load_dataset(path):
 if __name__ == "__main__":
     # Load anchor dataset D0
     print("Loading anchor dataset...")
-    D0 = load_dataset('????') # user supplies filename
+    D0 = load_dataset('C:/Users/matsu/Downloads/Hill_Valley_with_noise.tsv.gz') # user supplies filename
     D0 = (D0[0], D0[1])  #
     print("Anchor dataset loaded.")
 
     assert D0[0].shape[0] ==D0[1].shape[0] 
 
 
-    n_pop = 5
+    n_pop = 10 #25
+    
+    import os
+    if os.path.exists("log.txt"):
+            os.remove("log.txt")
+
+    if os.path.exists("generation_log.csv"):
+            os.remove("generation_log.csv")
 
     # Initial seeds (example)
     # --- Create queues ---
@@ -97,7 +104,7 @@ if __name__ == "__main__":
         'tau_init': 1e-2, 
         'taup_init': 1e-2,
         'Lmax': 8,
-        'n_generations': 100,
+        'n_generations': 50,
         'delta_eq': 0.2,
         'delta_gen': 0.25,
         'k_generators': 3,
@@ -109,8 +116,8 @@ if __name__ == "__main__":
     logger = MetricLogger()
 
     # --- Evolution settings ---
-    tau = 1 # 0.05
-    tau_prime = 0.3 # 0.07
+    tau = 0.3 #0.25 0.05
+    tau_prime = 0.35 #0.3 0.07
     L_max = 40
 
     engine = EvolutionEngine(
@@ -121,13 +128,18 @@ if __name__ == "__main__":
         tau=tau,
         tau_prime=tau_prime,
         L_max=L_max,
-        n_generations=40,
-        batch_size=5,
+        n_generations=50,
+        batch_size=n_pop,
         logger=logger,
         llm_enabled=False
     )
 
     eqs, gens = engine.run()
+
+    from plotting import plot_metrics
+
+    log_file = "generation_log.csv"
+    plot_metrics(log_file)
 
     
 
@@ -144,11 +156,12 @@ if __name__ == "__main__":
 
 
     model = PySRRegressor(
-    niterations=40,                  # Main compute knob (higher = better models)
-    populations=5,
+    niterations=50,                  # Main compute knob (higher = better models)
+    populations=n_pop,
     model_selection="best",          # Option: "best" or "accuracy"
     unary_operators=["sin", "cos"],  # Operator set
     binary_operators=["+", "-", "*", "/"],
+    maxsize=40,                     # Max tree size
 )
 
     model.fit(D0[0], D0[1])
@@ -157,7 +170,7 @@ if __name__ == "__main__":
 
     print(model.get_best())
 
-
+  
     print(model.equations_)  
 
     score = model.score(D0[0], D0[1])
